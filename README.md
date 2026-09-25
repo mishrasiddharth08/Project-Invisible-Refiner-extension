@@ -92,7 +92,12 @@ Extension code: [Apache License 2.0](LICENSE). This is an independent Forge adap
 
 ## Special thanks
 
+Special thanks to [u/malcolmrey and the r/malcolmrey community](https://www.reddit.com/r/malcolmrey/), [r/sdforall](https://www.reddit.com/r/sdforall/) and the [r/SECourses community](https://www.reddit.com/r/SECourses/) for support and inspiration.
+
+Thank you to [Forge Neo (sd-webui-forge-classic, neo branch) by Haoming02](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo), and to the Diffusers, Qwen, DeGrid, Spectrum and wider open-source communities.
+
+If you contribute, test, or report issues and would like to be named here, say so and you will be added.
+
 Part of the [Project Invisible](https://github.com/mishrasiddharth08) family —
 see also [Qwen-Image-2.1](https://github.com/mishrasiddharth08/Project-Invisible-Qwen2.1-extension)
 and [Ideogram 4](https://github.com/mishrasiddharth08/Project-Invisible-Ideogram4-extension).
-Thanks to [Forge Neo (sd-webui-forge-classic) by Haoming02](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo) and the open-source community.
