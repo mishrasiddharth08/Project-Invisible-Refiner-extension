@@ -1,103 +1,127 @@
 # Project Invisible — Refiner for Forge Neo
 
-**A fast second detail pass for ANY checkpoint Forge can load — SD 1.5, SDXL, Flux, Qwen-Image and more. Any quantization. Any VRAM size. One dropdown, no knobs.**
+**A second detail pass for ANY checkpoint Forge can load — without a separate tab, extra downloads or a Forge core fork.**
 
-[Installation](#beginner-installation) · [Usage](#step-by-step-usage) · [Combinations](#what-it-works-with) · [How it works](#how-it-works)
+[Installation](#beginner-installation) · [Usage](#step-by-step-usage) · [Philosophy](#the-project-invisible-philosophy) · [Troubleshooting](#troubleshooting-and-support)
 
-> This is an independent community extension, not an official product of any model vendor. Model licenses remain with their owners.
+> This is my first public project and I am still learning. Please forgive any mistakes or rough edges. Kind, complete bug reports will help improve the project for everyone.
 
-## The idea
+## Short description
 
-Most checkpoints benefit from a short polish pass after the main generation: fine detail sharpens, small artifacts smooth out. This extension adds that second pass **without** a second refiner checkpoint, **without** extra downloads and **without** extra VRAM — it re-runs the model that is already loaded over its own finished image, through Forge's normal img2img path.
+Unofficial Forge Neo extension that adds an optional second detail pass to the normal Generate workflow — for any checkpoint, any quantization, any VRAM size — without a separate tab, extra virtual environment or Forge core fork.
 
-"Invisible" means familiar: no new tabs, no new workflow. Pick a mode, press the normal Generate button.
+## Project overview
 
-## Why it is memory-efficient and fast
+Project Invisible — Refiner is an independent Forge Neo extension created to make a common generation wish — "polish the finished image a little more" — feel like a natural part of the existing WebUI.
 
-- **Zero extra model memory** — no second checkpoint is ever loaded. The pass reuses the weights already on your GPU, whatever their quantization (bf16, fp8, int8, and everything else Forge loads).
-- **Any VRAM size** — because no new weights appear, the pass uses the same VRAM envelope as your base generation. Forge's own memory management handles VRAM/RAM offloading and loading during the pass exactly as it does for any normal generation, so low-VRAM cards behave the same as always.
-- **Turbo speed** — Turbo mode runs a quarter-strength, quarter-step pass: usually just a moment per image. Balanced halves the steps; Quality uses your full step count at half denoise for the strongest polish.
-- **Fast VRAM↔RAM offloading** — the second pass flows through Forge's standard pipeline, so its streaming/offload/caching behavior (and anything your memory profile already does) applies to it automatically. Nothing new to configure.
+The basic idea is simple: generate as you always do, open the small Refiner panel, pick a mode and press the usual Generate button again. The extension performs the second pass behind the existing workflow instead of asking users to learn a separate refinement tool or workflow.
 
-## Features
+This is the author's first public project. It was built by a beginner who is still learning. Mistakes may exist, and patience is sincerely appreciated. Clear reports and complete error messages will help the project improve.
 
-- **Any model:** every checkpoint Forge loads, any quantization, any architecture.
-- **Any checkpoint permutation:** the refiner can use the same checkpoint (zero extra memory) or any other installed checkpoint — Forge's loader swaps it in for the pass and restores your base model afterwards, with fast VRAM↔RAM offloading handled by Forge itself.
-- **Three modes:** Turbo (fast), Balanced, Quality (best).
-- **Safe by design:** if the refiner pass fails for any reason, your base image is kept and the reason is logged.
-- **Honest metadata:** refined images record `Refiner: <mode>` in their PNG info.
-- **No core edits:** the extension only observes Forge's normal pipeline and calls it again; nothing in Forge is modified. Set the mode back to Off and behavior is instantly stock.
+## The Project Invisible philosophy
 
-## Beginner installation
+"Invisible" means integration with minimum disruption.
 
-1. Stop Forge completely.
-2. Choose **one** way — never both: **Install from URL** with this repository's URL, or **Download ZIP** and extract into `sd-webui-forge-classic/extensions/`.
-3. Avoid double nesting. The correct path ends with:
-   `extensions/<folder>/scripts/engine.py`.
-4. Start Forge normally. No extra dependencies are installed.
-5. Refresh your browser with **Ctrl+F5** after updates.
+The extension is designed around these principles:
+
+- use Forge Neo's normal interface and Generate button;
+- avoid adding a separate generation tab;
+- avoid requiring another virtual environment;
+- avoid modifying or forking Forge core files;
+- work with the checkpoint that is already loaded by default — zero extra model memory;
+- allow any checkpoint permutation: the same checkpoint, or any other installed checkpoint, with Forge's own loader swapping and restoring it;
+- show refiner controls only as a small, collapsed panel on the normal page;
+- leave unrelated models and extensions unchanged;
+- make errors, experimental behavior and quality trade-offs visible and honest.
+
+The extension is "invisible" in workflow, not in responsibility. It should never hide errors, limitations or quality trade-offs from the user.
+
+## Testing status
+
+The second pass has been tested and worked on the author's computer with local checkpoints through the normal txt2img flow.
+
+Other model architectures, quantizations and hardware combinations are untested or not fully confirmed. The code is written so that ANY checkpoint Forge loads can be refined — that is a design property, not a tested claim for every setup. Performance, memory use and compatibility vary with the GPU, driver, PyTorch build, Forge version, selected model files, resolution and enabled options. No claim is made that every NVIDIA or AMD configuration will work.
+
+## Main behavior
+
+After a normal generation finishes, the extension takes each finished sample and runs it back through Forge's own img2img machinery with a small denoising strength, a reduced step count, and the same (or your chosen) checkpoint. Because the second pass is an ordinary Forge job, every sampler, scheduler, CFG value, LoRA and preset combination the base run could use works unchanged.
+
+The implementation does not modify Forge core files. Setting the mode back to **Off** restores stock behavior immediately.
+
+## Memory management
+
+- **Default (same checkpoint):** no additional model is ever loaded. The pass reuses the weights already on your GPU, whatever their quantization (bf16, fp8, int8, and everything else Forge loads).
+- **Different checkpoint:** Forge's own model loader swaps the chosen checkpoint in for the pass and restores your base model afterwards. The swap speed and VRAM/RAM handoff are exactly what Forge itself provides.
+- Forge's memory management, offloading and streaming apply to the pass as they would to any normal generation. These are best-effort safeguards, not guarantees — a large model can still exceed available GPU memory or system RAM.
+
+## Speed modes
+
+| Mode | Denoise | Steps | Notes |
+|---|---|---|---|
+| Turbo (fast) | 0.25 | ¼ of your steps | Fastest; forces CFG 1 for the pass |
+| Balanced | 0.35 | ½ of your steps | Middle ground |
+| Quality (best) | 0.5 | your full steps | Strongest polish, keeps your CFG |
+
+Turbo adds only a moment per image; Quality adds roughly one extra pass.
+
+## Image honesty
+
+The second pass re-renders pixels at low denoise. Extremely fine text can shift slightly — use Turbo for the smallest change. The extension records `Refiner: <mode>` in the refined image's PNG info so refined results are always identifiable. If the pass fails for any reason, the base image is kept and the reason is logged to the terminal with a `[PI-Refiner]` prefix.
+
+The refiner is a targeted detail pass, not a general image enhancer. It cannot repair anatomy, composition, lighting, identity or weaknesses already present in the generated image.
 
 ## Step-by-step usage
 
 ![Step-by-step usage](docs/img/usage-steps.svg)
 
 1. **Generate as always** — pick your model, sampler, CFG, LoRAs; press Generate.
-2. **Open the Refiner panel** — it sits in the normal txt2img/img2img page.
-3. **Pick a mode** — Off (default), Turbo (fast), Balanced, or Quality (best).
-4. **(Optional) Pick a refiner checkpoint** — *Same as base* (default, zero extra memory) or any other installed checkpoint. Every permutation is possible: refine an SDXL image with another SDXL, a Flux image with Flux, mix freely.
-5. **Press Generate again** — the finished image is automatically re-run through a short detail pass and replaces the result in the gallery. If you chose a different checkpoint, Forge swaps it in for the pass and restores your base model afterwards.
+2. **Open the Refiner panel** — it sits on the normal txt2img/img2img page, collapsed by default.
+3. **Pick a mode** — Off (default), Turbo, Balanced, or Quality.
+4. **(Optional) Pick a refiner checkpoint** — *Same as base* (default) or any other installed checkpoint. Any permutation is possible.
+5. **Press Generate again** — the finished image is re-run through the detail pass and replaces the result.
 
-## What it works with
+## Beginner installation
 
-Everything, because it reuses your loaded checkpoint through Forge's own pipeline:
+1. Stop Forge completely.
+2. Choose **one** way — never both: **Install from URL** with this repository's URL, or **Download ZIP** and extract into `sd-webui-forge-classic/extensions/`.
+3. Avoid double nesting. The correct path ends with: `extensions/<folder>/scripts/engine.py`.
+4. Start Forge normally. No extra dependencies are installed.
+5. Refresh your browser with **Ctrl+F5** after updates.
 
-| Combination | Behavior |
-|---|---|
-| SD 1.5 / SDXL / SDXL refiner-less setups | Works |
-| Flux, Qwen-Image, and other modern checkpoints | Works |
-| Any quantization (bf16, fp8, int8, ...) | Works — refines with the loaded weights |
-| Any sampler / scheduler / CFG | Works — the pass inherits your choices (Turbo forces CFG 1) |
-| Any LoRA / embedding / preset | Works — they stay applied during the pass |
-| txt2img and img2img | Works — refines whatever the base run produced |
-| Any VRAM size / Save GPU memory / offload profiles | Works — no additional model memory, Forge's offloading applies |
-| **Any checkpoint permutation** | Works — refine with the *same* checkpoint (zero extra memory) or with **any other installed checkpoint**; Forge swaps it in for the pass and restores your base model afterwards |
+## Troubleshooting and support
 
-## How it works
+If a problem occurs, open a GitHub issue and paste the complete error from the DOS/terminal window. The report must begin at the first error line and continue through the final traceback line. A single final sentence is usually not enough to identify the cause.
 
-After a normal generation finishes, the extension takes each finished sample and runs it back through Forge's standard img2img machinery with:
+Reports should also include:
 
-- a small **denoising strength** (0.25 for Turbo, 0.35 Balanced, 0.5 Quality),
-- a reduced step count derived from your own steps (Turbo uses a quarter, Quality uses the full amount),
-- the **same loaded checkpoint, sampler and LoRAs** as the base run.
+- Windows and Forge Neo versions;
+- GPU, VRAM and system RAM;
+- base and refiner checkpoint filenames;
+- resolution and sampling steps;
+- whether Save GPU memory / offloading was enabled;
+- the selected Refiner mode and checkpoint;
+- exact reproduction steps.
 
-Because the second pass is an ordinary Forge img2img job, anything the base run could do, the refiner can do too — that is why the combinations table above is simply "works".
+Private usernames, paths, prompts, tokens and images should be removed before posting publicly.
 
-Turbo forces CFG 1 to keep the pass as fast as possible; the other modes keep your CFG scale.
+Users may also paste the complete error into ChatGPT, Claude, Gemini or Grok and ask for a beginner-friendly explanation.
 
-## Known limitations
+## Contributions
 
-- The pass re-renders pixels at low denoise; extremely fine text can shift slightly (use Turbo for the smallest change).
-- Batches are refined one image at a time, so a Quality pass on a large batch takes proportionally longer.
-- Forge updates may change extension hooks; keep a backup of the extension folder.
+Bug reports, documentation corrections and focused code improvements are welcome. Contributors should state exactly what was tested, avoid describing untested modes as working, preserve upstream licenses and never commit model weights, generated images, dependency folders, logs, access tokens or private information.
 
-## If something goes wrong
+## License and independence
 
-1. Set the mode back to **Off** — generation returns to stock behavior immediately.
-2. Check the terminal for `[PI-Refiner]` lines; failures keep the base image and log the reason.
-3. Open a GitHub issue with the complete terminal error.
+This extension is independent and unofficial. It is not an official product of any model vendor or of Forge. The repository does not relicense model weights; every model keeps its own license. Extension code: [Apache License 2.0](LICENSE).
 
-## License
+## A humble note from the author
 
-Extension code: [Apache License 2.0](LICENSE). This is an independent Forge adapter; it is not affiliated with any model vendor.
+This is a first public attempt by a non-programmer learning through experimentation and community help. Please forgive mistakes. Constructive feedback, patient explanations and complete error reports are welcomed with gratitude.
 
 ## Special thanks
 
-Special thanks to [u/malcolmrey and the r/malcolmrey community](https://www.reddit.com/r/malcolmrey/), [r/sdforall](https://www.reddit.com/r/sdforall/) and the [r/SECourses community](https://www.reddit.com/r/SECourses/) for support and inspiration.
+Special thanks to u/malcolmrey and the r/malcolmrey community for support and inspiration.
 
-Thank you to [Forge Neo (sd-webui-forge-classic, neo branch) by Haoming02](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo), and to the Diffusers, Qwen, DeGrid, Spectrum and wider open-source communities.
+Thanks also to the Forge Neo, Diffusers, Qwen, DeGrid, Spectrum and wider open-source communities whose work made this project possible.
 
 If you contribute, test, or report issues and would like to be named here, say so and you will be added.
-
-Part of the [Project Invisible](https://github.com/mishrasiddharth08) family —
-see also [Qwen-Image-2.1](https://github.com/mishrasiddharth08/Project-Invisible-Qwen2.1-extension)
-and [Ideogram 4](https://github.com/mishrasiddharth08/Project-Invisible-Ideogram4-extension).
