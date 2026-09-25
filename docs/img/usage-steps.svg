@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="620" font-family="Segoe UI, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2230"/><stop offset="1" stop-color="#10151f"/>
+    </linearGradient>
+  </defs>
+  <rect width="900" height="620" fill="url(#bg)"/>
+  <text x="450" y="40" fill="#e8ecf4" font-size="22" font-weight="600" text-anchor="middle">Project Invisible Refiner — one dropdown, any model</text>
+
+  <g>
+    <rect x="40" y="80" width="390" height="110" rx="10" fill="#232b3a" stroke="#3a465c"/>
+    <circle cx="80" cy="135" r="22" fill="#5b82d6"/><text x="80" y="142" fill="#fff" font-size="18" font-weight="600" text-anchor="middle">1</text>
+    <text x="120" y="118" fill="#e8ecf4" font-size="15" font-weight="600">Generate as always</text>
+    <text x="120" y="140" fill="#9fb0c9" font-size="12">Pick any model, sampler, CFG, LoRAs.</text>
+    <text x="120" y="158" fill="#9fb0c9" font-size="12">Press Forge's normal Generate button.</text>
+  </g>
+  <g>
+    <rect x="470" y="80" width="390" height="110" rx="10" fill="#232b3a" stroke="#3a465c"/>
+    <circle cx="510" cy="135" r="22" fill="#5b82d6"/><text x="510" y="142" fill="#fff" font-size="18" font-weight="600" text-anchor="middle">2</text>
+    <text x="550" y="118" fill="#e8ecf4" font-size="15" font-weight="600">Open the Refiner panel</text>
+    <text x="550" y="140" fill="#9fb0c9" font-size="12">Sits on the normal txt2img / img2img page,</text>
+    <text x="550" y="158" fill="#9fb0c9" font-size="12">collapsed by default. No new tabs.</text>
+  </g>
+  <g>
+    <rect x="40" y="220" width="390" height="110" rx="10" fill="#232b3a" stroke="#3a465c"/>
+    <circle cx="80" cy="275" r="22" fill="#5b82d6"/><text x="80" y="282" fill="#fff" font-size="18" font-weight="600" text-anchor="middle">3</text>
+    <text x="120" y="255" fill="#e8ecf4" font-size="15" font-weight="600">Pick a mode</text>
+    <text x="120" y="277" fill="#9fb0c9" font-size="12">Off · Turbo (fast) · Balanced · Quality (best).</text>
+    <text x="120" y="295" fill="#9fb0c9" font-size="12">Turbo runs a quarter-step pass in a moment.</text>
+  </g>
+  <g>
+    <rect x="470" y="220" width="390" height="110" rx="10" fill="#232b3a" stroke="#3a465c"/>
+    <circle cx="510" cy="275" r="22" fill="#5b82d6"/><text x="510" y="282" fill="#fff" font-size="18" font-weight="600" text-anchor="middle">4</text>
+    <text x="550" y="255" fill="#e8ecf4" font-size="15" font-weight="600">Optionally pick a checkpoint</text>
+    <text x="550" y="277" fill="#9fb0c9" font-size="12">Same as base (zero extra memory) or ANY other</text>
+    <text x="550" y="295" fill="#9fb0c9" font-size="12">installed checkpoint — any permutation works.</text>
+  </g>
+  <g>
+    <rect x="40" y="360" width="820" height="100" rx="10" fill="#24304a" stroke="#5b82d6" stroke-width="2"/>
+    <circle cx="80" cy="410" r="22" fill="#5b82d6"/><text x="80" y="417" fill="#fff" font-size="18" font-weight="600" text-anchor="middle">5</text>
+    <text x="120" y="392" fill="#e8ecf4" font-size="15" font-weight="600">Press Generate again</text>
+    <text x="120" y="414" fill="#9fb0c9" font-size="12">The finished image is re-run through a short detail pass and replaces the result.</text>
+    <text x="120" y="432" fill="#9fb0c9" font-size="12">A swapped refiner checkpoint is restored to your base model afterwards.</text>
+  </g>
+
+  <!-- Memory / speed illustration -->
+  <text x="60" y="500" fill="#8fa3c4" font-size="13" font-weight="600">Why it fits any VRAM</text>
+  <rect x="60" y="515" width="380" height="80" rx="8" fill="#1e2736" stroke="#3a465c"/>
+  <text x="80" y="540" fill="#9fe3a1" font-size="12">✓ No second model is loaded</text>
+  <text x="80" y="560" fill="#9fb0c9" font-size="11">Same checkpoint reuses the weights already on your GPU.</text>
+  <text x="80" y="578" fill="#9fb0c9" font-size="11">Forge's own VRAM↔RAM offloading handles everything.</text>
+  <rect x="460" y="515" width="380" height="80" rx="8" fill="#1e2736" stroke="#3a465c"/>
+  <text x="480" y="540" fill="#9fe3a1" font-size="12">✓ Any checkpoint permutation</text>
+  <text x="480" y="560" fill="#9fb0c9" font-size="11">Choose a different installed checkpoint for the pass;</text>
+  <text x="480" y="578" fill="#9fb0c9" font-size="11">Forge swaps it in fast and restores your base model.</text>
+</svg>
