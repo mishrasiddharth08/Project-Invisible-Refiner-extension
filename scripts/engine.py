@@ -1,38 +1,41 @@
-"""PROJECT INVISIBLE — Refiner.
+"""Use Forge Neo's native Refiner controls for a decoded-image second pass."""
+import copy
+import logging
+from modules import scripts, script_callbacks, processing, shared, sd_models
 
-A model-agnostic second detail pass for any checkpoint Forge can load
-(SD 1.5, SDXL, Flux, Qwen-Image, and anything else). One dropdown, no knobs.
+log = logging.getLogger('PI-Refiner')
+_original_setups = {}
 
-Any permutation of checkpoints is possible: the pass can run on the SAME
-checkpoint that produced the image (zero extra memory) or on ANY other
-installed checkpoint (Forge swaps it in, refines, and swaps the base model
-back). Forge's own memory management handles the VRAM/RAM offloading and
-loading of both models, which keeps the swap as fast as Forge can be.
 
-Philosophy (Project Invisible): no Forge core edits, no extra model downloads.
-The refiner runs a short img2img-style pass over each finished image through
-Forge's own pipeline, so every sampler, scheduler, CFG, LoRA and preset
-combination works unchanged. If the pass fails for any reason the base image
-is kept.
-"""
-import gradio as gr
-from modules import scripts, script_callbacks, processing, sd_models, shared
+def _setup(self, p, enabled, checkpoint, switch, cfg, replacements, *args, **kwargs):
+    result = _original_setups[type(self)](self, p, enabled, checkpoint, switch, cfg, replacements, *args, **kwargs)
+    p._pi_refiner = None
+    if enabled and checkpoint not in (None, '', 'None'):
+        p._pi_refiner = (checkpoint, float(switch), cfg)
+        p.refiner_checkpoint = p.refiner_switch_at = p.refiner_checkpoint_info = None
+    return result
 
-TAG = '[PI-Refiner]'
-SAME = '(same checkpoint as the base run)'
 
-# mode -> (denoise strength, step multiplier, force_cfg1)
-MODES = {
-    'Off': None,
-    'Turbo (fast)': (0.25, 0.25, True),    # light pass, quarter of the steps
-    'Balanced': (0.35, 0.5, False),
-    'Quality (best)': (0.5, 1.0, False),
-}
+def _value(p, name, index, fallback):
+    values = getattr(p, name, None)
+    return values[index] if values is not None and index < len(values) else fallback
+
+
+def _prompt(prompt):
+    from modules import extra_networks, sd_samplers_common
+    text, networks = extra_networks.parse_prompt(prompt)
+    loras = copy.deepcopy(networks.pop('lora', []))
+    if loras:
+        loras = sd_samplers_common.apply_lora_for_refiner(loras)
+    else:
+        _, _, appended = sd_samplers_common._parse_replacements(shared.opts.refiner_lora_replacement.strip())
+        loras = [extra_networks.ExtraNetworkParams([n, w]) for n, w in appended]
+    networks['lora'] = loras
+    return text + ''.join(' <' + kind + ':' + ':'.join(map(str, param.items)) + '>'
+                          for kind, params in networks.items() for param in params)
 
 
 class Script(scripts.Script):
-    _pi_universal_refiner = True
-
     def title(self):
         return 'PROJECT INVISIBLE — Refiner'
 
@@ -40,96 +43,101 @@ class Script(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        with gr.Accordion('Refiner', open=False,
-                          elem_classes=['pi-refiner-panel']):
-            gr.Markdown(
-                'A fast second detail pass over the finished image. Works with '
-                'every model, quantization, VRAM size, sampler, CFG and LoRA '
-                'combination. No downloads, memory-efficient by design.')
-            refine = gr.Dropdown(list(MODES), value='Off', label='Refine result',
-                                 info='Turbo adds a moment; Quality adds roughly one extra pass. Off restores stock behavior.')
-            choices = [SAME] + sorted(sd_models.checkpoints_list)
-            refiner_ckpt = gr.Dropdown(choices, value=SAME, label='Refiner checkpoint',
-                                       info='Any permutation: same checkpoint (zero extra memory) or any other installed checkpoint — Forge swaps it in for the pass and restores your base model after.')
-        return [refine, refiner_ckpt]
+        return []
 
-    def postprocess(self, p, processed, refine=None, refiner_ckpt=SAME):
-        spec = MODES.get(str(refine or 'Off'))
-        if spec is None or not getattr(processed, 'images', None):
+    def postprocess_image_after_composite(self, p, pp, *args):
+        spec = getattr(p, '_pi_refiner', None)
+        if not spec or getattr(p, '_pi_refining', False) or shared.state.interrupted or shared.state.skipped:
             return
-        strength, step_mult, force_cfg1 = spec
-        # Only real samples carry PNG info; skip grid crops and UI previews.
-        targets = [im for im in processed.images
-                   if getattr(im, 'info', None) and not getattr(im, '_pi_refined', False)]
-        if not targets:
+        checkpoint, switch, cfg = spec
+        strength = max(0.0, min(1.0, 1.0 - switch))
+        if strength == 0:
             return
-        base_steps = max(1, int(getattr(p, 'steps', 20) or 20))
-        steps = max(2, min(40, round(base_steps * step_mult)))
-        cfg = 1.0 if force_cfg1 else float(getattr(p, 'cfg_scale', 1.0) or 1.0)
-        sampler = getattr(p, 'sampler_name', 'Euler') or 'Euler'
-        # Any checkpoint permutation: same model (zero extra memory) or any
-        # other installed checkpoint. Forge's loader swaps and restores it.
-        wanted = str(refiner_ckpt or SAME).strip()
-        swap = None
-        if wanted and wanted != SAME and wanted in sd_models.checkpoints_list:
-            current = shared.opts.sd_model_checkpoint
-            if wanted != current:
-                swap = (current, wanted)
-        print(f'{TAG} refining {len(targets)} image(s): denoise {strength}, '
-              f'{steps} steps, CFG {cfg}, sampler {sampler}, '
-              f'checkpoint {wanted if swap else "same as base"}')
-        refined = {id(im): None for im in targets}
+        if sd_models.get_closet_checkpoint_match(checkpoint) is None:
+            p.extra_generation_params['Refiner error'] = 'Checkpoint unavailable: ' + checkpoint
+            log.error('Checkpoint unavailable: %s', checkpoint)
+            return
+        from modules_forge import main_entry
+        keys = ('sd_model_checkpoint', 'forge_additional_modules', 'forge_unet_storage_dtype')
+        options = {k: copy.deepcopy(shared.opts.data[k]) for k in keys if k in shared.opts.data}
+        state_keys = ('job', 'job_no', 'job_count', 'sampling_step', 'sampling_steps',
+                      'current_latent', 'current_image', 'id_live_preview')
+        state = {k: getattr(shared.state, k) for k in state_keys if hasattr(shared.state, k)}
+        job = None
+        p._pi_refining = True
         try:
-            if swap:
-                sd_models.reload_model_weights(shared.sd_model, info=sd_models.checkpoints_list.get(swap[1]))
-                if shared.sd_model.sd_checkpoint_info is None or getattr(shared.sd_model.sd_checkpoint_info, 'name', None) != swap[1]:
-                    raise RuntimeError('checkpoint swap failed')
+            main_entry.checkpoint_change(checkpoint, preset=None, save=False, refresh=True)
+            i = pp.index
+            job = processing.StableDiffusionProcessingImg2Img(
+                init_images=[pp.image], resize_mode=0, width=pp.image.width, height=pp.image.height,
+                prompt=_prompt(_value(p, 'all_prompts', i, p.prompt)),
+                negative_prompt=_value(p, 'all_negative_prompts', i, p.negative_prompt),
+                seed=_value(p, 'all_seeds', i, p.seed), subseed=_value(p, 'all_subseeds', i, p.subseed),
+                subseed_strength=p.subseed_strength, steps=p.steps, denoising_strength=strength,
+                cfg_scale=cfg if cfg is not None and cfg >= 1 else p.cfg_scale,
+                distilled_cfg_scale=p.distilled_cfg_scale, sampler_name=p.sampler_name,
+                scheduler=p.scheduler, batch_size=1, n_iter=1,
+                do_not_save_samples=True, do_not_save_grid=True)
+            # Preserve the full-resolution inpainting mask where supplied.
+            mask = getattr(p, 'image_mask', None)
+            if mask is not None:
+                job.image_mask = mask
+                for name in ('inpainting_mask_invert', 'mask_blur', 'inpainting_fill'):
+                    if hasattr(p, name):
+                        setattr(job, name, getattr(p, name))
+            job._pi_refining = True
+            job.scripts = None
+            job.disable_extra_networks = getattr(p, 'disable_extra_networks', False)
+            output = processing.process_images(job)
+            if shared.state.interrupted or shared.state.skipped:
+                return
+            first = getattr(output, 'index_of_first_image', 0)
+            if first >= len(output.images):
+                raise RuntimeError('Refiner returned no sample')
+            pp.image = output.images[first]
+            p.extra_generation_params.pop('Refiner error', None)
+            p.extra_generation_params.update({'Refiner': checkpoint,
+                'Refiner denoising strength': strength, 'Refiner CFG scale': job.cfg_scale})
         except Exception as exc:
-            print(f'{TAG} falling back to the base checkpoint: {exc}')
-            swap = None
-        try:
-            for image in targets:
-                try:
-                    job = processing.StableDiffusionProcessingImg2Img(
-                        init_images=[image],
-                        resize_mode=0,
-                        denoising_strength=strength,
-                        prompt=getattr(p, 'prompt', '') or '',
-                        negative_prompt='' if force_cfg1 else (getattr(p, 'negative_prompt', '') or ''),
-                        cfg_scale=cfg,
-                        steps=steps,
-                        sampler_name=sampler,
-                        width=getattr(image, 'width', None) or int(getattr(p, 'width', 512)),
-                        height=getattr(image, 'height', None) or int(getattr(p, 'height', 512)),
-                        seed=int(getattr(p, 'seed', -1) or -1),
-                        subseed=int(getattr(p, 'subseed', -1) or -1),
-                        do_not_save_samples=True,
-                        do_not_reload_embeddings=True,
-                    )
-                    # Match the base run's scheduler when the attribute exists.
-                    scheduler = getattr(p, 'scheduler_name', None)
-                    if scheduler:
-                        try: job.scheduler_name = scheduler
-                        except Exception: pass
-                    job.disable_extra_networks = True
-                    run = processing.process_images(job)
-                    if not run.images:
-                        raise RuntimeError('empty result')
-                    out = run.images[0]
-                    out.info = dict(getattr(image, 'info', {}) or {})
-                    out.info['Refiner'] = f'{refine} (denoise {strength}, {steps} steps)'
-                    out._pi_refined = True
-                    refined[id(image)] = out
-                except Exception as exc:
-                    print(f'{TAG} refiner pass failed; keeping the base image: {exc}')
+            p.extra_generation_params['Refiner error'] = str(exc)
+            log.exception('Refinement failed; retaining original image')
         finally:
-            if swap:
+            try:
+                if job is not None:
+                    job.close()
+            finally:
                 try:
-                    sd_models.reload_model_weights(shared.sd_model, info=sd_models.checkpoints_list.get(swap[0]))
-                except Exception as exc:
-                    print(f'{TAG} base checkpoint restore failed; select it manually: {exc}')
-        if any(v is not None for v in refined.values()):
-            processed.images = [refined.get(id(im)) or im for im in processed.images]
+                    for key in keys:
+                        if key in options:
+                            shared.opts.data[key] = options[key]
+                        else:
+                            shared.opts.data.pop(key, None)
+                    main_entry.refresh_model_loading_parameters(refresh=True)
+                    sd_models.forge_model_reload()
+                finally:
+                    for key, value in state.items():
+                        setattr(shared.state, key, value)
+                    p._pi_refining = False
 
 
-script_callbacks.on_script_unloaded(lambda: None)
+def _install():
+    # Forge loads built-in files under dynamic module names. Patch the actual
+    # registered class, not a separately imported copy (which duplicates UI).
+    for data in scripts.scripts_data:
+        cls = data.script_class
+        if cls.__name__ == 'ScriptRefiner' and cls not in _original_setups:
+            _original_setups[cls] = cls.setup
+            cls.setup = _setup
+
+
+script_callbacks.on_before_ui(_install)
+
+
+def _unload():
+    for cls, original in _original_setups.items():
+        if cls.setup is _setup:
+            cls.setup = original
+    _original_setups.clear()
+
+
+script_callbacks.on_script_unloaded(_unload)
