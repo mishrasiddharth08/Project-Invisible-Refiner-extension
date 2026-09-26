@@ -15,21 +15,21 @@ A decoded-image second pass using Forge Neo's **existing Refiner** controls. No 
 The extension replaces the native mid-sampling latent switch with a separate image-to-image pass. This allows different model families to exchange pixels where both Forge loading and the receiving model's image input are supported.
 
 ## The Project Invisible philosophy
-Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, and LoRA replacement rules are forwarded. Incompatible LoRAs still require replacement/removal rules.
+Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, are forwarded. The LoRA rules textbox and explanatory panel are removed; prompt LoRAs are left unchanged. Use LoRAs compatible with the receiving model.
 
 ## Testing status
-Six automated regression tests pass with simulated Forge objects. They cover native controls, metadata-free samples, batch identity, cancellation, failure restoration, and unloading. **GPU generation, visual quality, model pairings, and memory/speed measurements remain unverified.**
+Sixteen automated regression tests pass. They cover native controls, metadata-free samples, batch identity, cancellation, failure restoration, direct-pipeline routing, file replacement, and unloading. A live RTX 5090 test completed with Qwen 2.1 INT8 ConvRot as both base and refiner (512x512, 2 steps, seed 12345). Refined pixels differed from the matching unrefined run; the saved PNG matched the refined gallery and contained Refiner metadata. This verifies that route, not production visual quality, other pairings, or performance guarantees.
 
-The receiving checkpoint must support image-to-image in the installed Forge integration. Custom pipelines that bypass Forge's image callbacks are not supported by this version. Text-only models cannot become image refiners through checkpoint selection alone. Cross-family external VAE/text-encoder selections must be valid for the target model; automatic component selection depends on the installed loader/preset integration.
+The receiving checkpoint must support image-to-image in the installed Forge integration. Direct pipelines such as Qwen 2.1 are handled at the generation entry points, even when they bypass Forge image callbacks. Their finished images are refined after the base call returns, then the same saved filenames and gallery entries are updated. This avoids calling another model while the base pipeline is still rendering. Pipelines must return Forge-compatible image results; image saving outside Forge's save function is not intercepted. Text-only models cannot become image refiners through checkpoint selection alone. Cross-family external VAE/text-encoder selections must be valid for the target model; automatic component selection depends on the installed loader/preset integration.
 
 ## Main behavior
-The pass runs before Forge saves samples and builds grids, so normal saved images and gallery samples use the refined result. No dependence on PNG metadata. Each batch image keeps its own prompt and seed, including seed zero. Interrupt retains the original image. Errors are logged with a traceback and included in generation parameters. Failed passes retain the original.
+For stock Forge, the pass runs before saving. For direct pipelines, the extension replaces the saved image atomically after successful refinement and updates the gallery. If interrupted before refinement, original images remain. No dependence on PNG metadata. Each batch image keeps its own prompt and seed, including seed zero. Interrupt retains the original image. Errors are logged with a traceback and included in generation parameters. Failed passes retain the original.
 
 ## Memory management
-Forge owns loading, quantization, and offloading. The extension does not convert or dequantize weights and does not maintain a second model cache. Different checkpoints require swapping back before the base job continues, which costs time. Peak memory and speed depend on the backend, model, resolution, and available RAM/VRAM. No promise of universal quantization support or zero extra memory is made.
+Forge owns loading, quantization, and offloading. The extension does not convert or dequantize weights and does not maintain a second model cache. Different checkpoints require switching, which costs time. The Qwen worker is released before switching to another checkpoint. Direct-pipeline base models are not forced through the stock Forge loader during restoration. Peak memory and speed depend on the backend, model, resolution, and available RAM/VRAM. No promise of universal quantization support or zero extra memory is made.
 
 ## Speed and strength
-Use **Switch at** as the preserved base-image fraction: 0.75 means 0.25 denoising; 1 means no refinement. This extension interprets it as a fraction even when native Forge is configured for sigma switching. Steps follow the base job and Forge's img2img step rules. Refiner CFG below 1 inherits base CFG. LoRA Replacements remain available.
+Use **Switch at** as the preserved base-image fraction: 0.75 means 0.25 denoising; 1 means no refinement. This extension interprets it as a fraction even when native Forge is configured for sigma switching. Steps follow the base job and Forge's img2img step rules. Refiner CFG below 1 inherits base CFG. Reference-image editing models such as Qwen 2.1 use their native image guidance and may not honor an img2img denoising fraction; a value of 1 always skips the pass. The LoRA rules UI is removed.
 
 ## Image honesty
 Refinement can change text, faces, and details. Metadata records the target, strength, and CFG. Inspect output quality before relying on a pairing.
@@ -38,7 +38,7 @@ Refinement can change text, faces, and details. Metadata records the target, str
 1. Select your base checkpoint/preset normally.
 2. Enable Forge's existing **Refiner** accordion. If hidden, enable Refiner visibility in Forge settings.
 3. Select the target checkpoint; select the base checkpoint again for same-model refinement.
-4. Start with **Switch at 0.75**. Adjust CFG and LoRA Replacements only if needed.
+4. Start with **Switch at 0.75**. Adjust CFG only if needed.
 5. Press **Generate**. Check generation parameters and the terminal for errors.
 
 ## Beginner installation
