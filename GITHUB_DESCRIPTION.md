@@ -1,122 +1,57 @@
-PROJECT INVISIBLE  |  GITHUB DESCRIPTION
+# PROJECT INVISIBLE | GITHUB DESCRIPTION
 
-Project Invisible — Refiner for Forge Neo
+# Project Invisible — Refiner for Forge Neo
 
-GitHub-ready project description
+**A second detail pass for ANY checkpoint Forge can load — without a separate tab, extra downloads or a Forge core fork.**
 
-Short GitHub "About" description
+[Installation](#beginner-installation) · [Usage](#step-by-step-usage) · [Philosophy](#the-project-invisible-philosophy) · [Troubleshooting](#troubleshooting-and-support)
 
-Unofficial Forge Neo extension that adds an optional second detail pass to the
-normal Generate workflow — for any checkpoint, any quantization, any VRAM size —
-without a separate tab, extra virtual environment or Forge core fork.
+> This is my first public project and I am still learning. Please forgive any mistakes or rough edges. Kind, complete bug reports will help improve the project for everyone.
 
-Project overview
+## Short description
+A decoded-image second pass using Forge Neo's **existing Refiner** controls. No extra panel, dependencies, model downloads, or Forge core edits.
 
-Project Invisible — Refiner is an independent Forge Neo extension created to
-make a common generation wish — "polish the finished image a little more" —
-feel like a natural part of the existing WebUI.
+## Project overview
+The extension replaces the native mid-sampling latent switch with a separate image-to-image pass. This allows different model families to exchange pixels where both Forge loading and the receiving model's image input are supported.
 
-The basic idea is simple: generate as you always do, open the small Refiner
-panel, pick a mode and press the usual Generate button again. The extension
-performs the second pass behind the existing workflow instead of asking users
-to learn a separate refinement tool or workflow.
+## The Project Invisible philosophy
+Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, and LoRA replacement rules are forwarded. Incompatible LoRAs still require replacement/removal rules.
 
-This is the author's first public project. It was built by a beginner who is
-still learning. Mistakes may exist, and patience is sincerely appreciated.
-Clear reports and complete error messages will help the project improve.
+## Testing status
+Six automated regression tests pass with simulated Forge objects. They cover native controls, metadata-free samples, batch identity, cancellation, failure restoration, and unloading. **GPU generation, visual quality, model pairings, and memory/speed measurements remain unverified.**
 
-The Project Invisible philosophy
+The receiving checkpoint must support image-to-image in the installed Forge integration. Custom pipelines that bypass Forge's image callbacks are not supported by this version. Text-only models cannot become image refiners through checkpoint selection alone. Cross-family external VAE/text-encoder selections must be valid for the target model; automatic component selection depends on the installed loader/preset integration.
 
-"Invisible" means integration with minimum disruption.
+## Main behavior
+The pass runs before Forge saves samples and builds grids, so normal saved images and gallery samples use the refined result. No dependence on PNG metadata. Each batch image keeps its own prompt and seed, including seed zero. Interrupt retains the original image. Errors are logged with a traceback and included in generation parameters. Failed passes retain the original.
 
-The extension is designed around these principles:
+## Memory management
+Forge owns loading, quantization, and offloading. The extension does not convert or dequantize weights and does not maintain a second model cache. Different checkpoints require swapping back before the base job continues, which costs time. Peak memory and speed depend on the backend, model, resolution, and available RAM/VRAM. No promise of universal quantization support or zero extra memory is made.
 
-- use Forge Neo's normal interface and Generate button;
-- avoid adding a separate generation tab;
-- avoid requiring another virtual environment;
-- avoid modifying or forking Forge core files;
-- work with the checkpoint that is already loaded by default — zero extra
-  model memory;
-- allow any checkpoint permutation: the same checkpoint, or any other
-  installed checkpoint, with Forge's own loader swapping and restoring it;
-- show refiner controls only as a small, collapsed panel on the normal page;
-- leave unrelated models and extensions unchanged;
-- make errors, experimental behavior and quality trade-offs visible and honest.
+## Speed and strength
+Use **Switch at** as the preserved base-image fraction: 0.75 means 0.25 denoising; 1 means no refinement. This extension interprets it as a fraction even when native Forge is configured for sigma switching. Steps follow the base job and Forge's img2img step rules. Refiner CFG below 1 inherits base CFG. LoRA Replacements remain available.
 
-The extension is "invisible" in workflow, not in responsibility. It should
-never hide errors, limitations or quality trade-offs from the user.
+## Image honesty
+Refinement can change text, faces, and details. Metadata records the target, strength, and CFG. Inspect output quality before relying on a pairing.
 
-Testing status
+## Step-by-step usage
+1. Select your base checkpoint/preset normally.
+2. Enable Forge's existing **Refiner** accordion. If hidden, enable Refiner visibility in Forge settings.
+3. Select the target checkpoint; select the base checkpoint again for same-model refinement.
+4. Start with **Switch at 0.75**. Adjust CFG and LoRA Replacements only if needed.
+5. Press **Generate**. Check generation parameters and the terminal for errors.
 
-The second pass has been tested and worked on the author's computer with local
-checkpoints through the normal txt2img flow.
+## Beginner installation
 
-Other model architectures, quantizations and hardware combinations are
-untested or not fully confirmed. The code is written so that any checkpoint
-Forge loads can be refined — that is a design property, not a tested claim
-for every setup. Performance, memory use and compatibility vary with the GPU,
-driver, PyTorch build, Forge version, selected model files, resolution and
-enabled options. No claim is made that every NVIDIA or AMD configuration
-will work.
+1. Stop Forge completely.
+2. Choose **one** way — never both: **Install from URL** with this repository's URL, or **Download ZIP** and extract into `sd-webui-forge-classic/extensions/`.
+3. Avoid double nesting. The correct path ends with: `extensions/<folder>/scripts/engine.py`.
+4. Start Forge normally. No extra dependencies are installed.
+5. Refresh your browser with **Ctrl+F5** after updates.
 
-Main behavior
+## Troubleshooting and support
 
-After a normal generation finishes, the extension takes each finished sample
-and runs it back through Forge's own img2img machinery with a small denoising
-strength, a reduced step count, and the same (or the user's chosen)
-checkpoint. Because the second pass is an ordinary Forge job, every sampler,
-scheduler, CFG value, LoRA and preset combination the base run could use
-works unchanged.
-
-The implementation does not modify Forge core files. Setting the mode back to
-Off restores stock behavior immediately.
-
-Memory management
-
-- Default (same checkpoint): no additional model is ever loaded. The pass
-  reuses the weights already on the GPU, whatever their quantization.
-- Different checkpoint: Forge's own model loader swaps the chosen checkpoint
-  in for the pass and restores the base model afterwards.
-- Forge's memory management, offloading and streaming apply to the pass as
-  they would to any normal generation. These are best-effort safeguards, not
-  guarantees.
-
-Speed modes
-
-- Turbo (fast): 0.25 denoise, a quarter of the user's steps, CFG 1 for the
-  pass. The fastest option; usually only a moment per image.
-- Balanced: 0.35 denoise, half of the user's steps.
-- Quality (best): 0.5 denoise, the user's full step count, keeps the user's
-  CFG.
-
-Image honesty
-
-The second pass re-renders pixels at low denoise. Extremely fine text can
-shift slightly; Turbo makes the smallest change. Refined images record
-"Refiner: <mode>" in their PNG info so refined results are always
-identifiable. If the pass fails for any reason, the base image is kept and
-the reason is logged in the terminal with a [PI-Refiner] prefix.
-
-The refiner is a targeted detail pass, not a general image enhancer. It
-cannot repair anatomy, composition, lighting, identity or weaknesses already
-present in the generated image.
-
-Beginner installation
-
-Download the repository ZIP, extract it and copy the folder into:
-
-    sd-webui-forge-classic\extensions\
-
-Start Forge normally. No extra dependencies are installed. After updating the
-extension, refresh the browser with Ctrl+F5. The README contains the usage
-steps and troubleshooting guidance.
-
-Troubleshooting and support
-
-If a problem occurs, users should open a GitHub issue and paste the complete
-error from the DOS/terminal window. The report must begin at the first error
-line and continue through the final traceback line. A single final sentence
-is usually not enough to identify the cause.
+If a problem occurs, open a GitHub issue and paste the complete error from the DOS/terminal window. The report must begin at the first error line and continue through the final traceback line. A single final sentence is usually not enough to identify the cause.
 
 Reports should also include:
 
@@ -128,38 +63,26 @@ Reports should also include:
 - the selected Refiner mode and checkpoint;
 - exact reproduction steps.
 
-Private usernames, paths, prompts, tokens and images should be removed
-before posting publicly.
+Private usernames, paths, prompts, tokens and images should be removed before posting publicly.
 
-Users may also paste the complete error into ChatGPT, Claude, Gemini or Grok
-and ask for a beginner-friendly explanation.
+Users may also paste the complete error into ChatGPT, Claude, Gemini or Grok and ask for a beginner-friendly explanation.
 
-Contributions
+## Contributions
 
-Bug reports, documentation corrections and focused code improvements are
-welcome. Contributors should state exactly what was tested, avoid describing
-untested modes as working, preserve upstream licenses and never commit model
-weights, generated images, dependency folders, logs, access tokens or
-private information.
+Bug reports, documentation corrections and focused code improvements are welcome. Contributors should state exactly what was tested, avoid describing untested modes as working, preserve upstream licenses and never commit model weights, generated images, dependency folders, logs, access tokens or private information.
 
-License and independence
+## License and independence
 
-This extension is independent and unofficial. It is not an official product
-of any model vendor or of Forge. The repository does not relicense model
-weights; every model keeps its own license. Extension code is released under
-the Apache License 2.0.
+This extension is independent and unofficial. It is not an official product of any model vendor or of Forge. The repository does not relicense model weights; every model keeps its own license. Extension code: [Apache License 2.0](LICENSE).
 
-A humble note from the author
+## A humble note from the author
 
-This is a first public attempt by a non-programmer learning through
-experimentation and community help. Please forgive mistakes. Constructive
-feedback, patient explanations and complete error reports are welcomed with
-gratitude.
+This is a first public attempt by a non-programmer learning through experimentation and community help. Please forgive mistakes. Constructive feedback, patient explanations and complete error reports are welcomed with gratitude.
 
-Special thanks
+## Special thanks
 
-Special thanks to u/malcolmrey and the r/malcolmrey community for support and
-inspiration.
+Special thanks to u/malcolmrey and the r/malcolmrey community for support and inspiration.
 
-Thanks also to the Forge Neo, Diffusers, Qwen, DeGrid, Spectrum and wider
-open-source communities whose work made this project possible.
+Thanks also to the Forge Neo, Diffusers, Qwen, DeGrid, Spectrum and wider open-source communities whose work made this project possible.
+
+If you contribute, test, or report issues and would like to be named here, say so and you will be added.
