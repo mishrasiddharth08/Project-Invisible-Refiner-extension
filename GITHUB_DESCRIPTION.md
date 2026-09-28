@@ -79,7 +79,14 @@ This extension is independent and unofficial. It is not an official product of a
 
 This is a first public attempt by a non-programmer learning through experimentation and community help. Please forgive mistakes. Constructive feedback, patient explanations and complete error reports are welcomed with gratitude.
 
-## Special thanks
+## Special Thanks
+
+- [**r/sdforall**](https://www.reddit.com/r/sdforall/) - community discussion and testing
+- [**r/SECourses**](https://www.reddit.com/r/SECourses/) - community discussion and testing
+- [**r/malcolmrey**](https://www.reddit.com/r/malcolmrey/) - community discussion and testing
+- [**Haoming02 / sd-webui-forge-classic (neo branch)**](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo) - the Forge Neo tree this extension targets
+- [**ComfyUI**](https://github.com/comfyanonymous/ComfyUI) - reference for upstream sampler/scheduler coverage
+- The Forge / AUTOMATIC1111 community - for the extension ecosystem this plugs into
 
 Special thanks to u/malcolmrey and the r/malcolmrey community for support and inspiration.
 
