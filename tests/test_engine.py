@@ -195,7 +195,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.modules.processing.process_images.call_count,3)
         self.assertEqual(self.opts.data,original)
         self.modules.sd_models.forge_model_reload.assert_not_called()
-        self.entry.refresh_model_loading_parameters.assert_not_called()
+        self.entry.refresh_model_loading_parameters.assert_called_once_with(refresh=True)
 
     def test_same_checkpoint_does_not_switch_or_reload(self):
         self.p._pi_refiner = ('base', .75, 0)
@@ -321,7 +321,7 @@ class Tests(unittest.TestCase):
             self.assertIsNone(self.p.init_latent)
             self.assertIs(self.p.image_mask,mask)
             self.assertEqual(self.p.init_images,[self.original])
-        self.p.clear_prompt_cache.assert_called_once()
+        self.assertEqual(self.p.clear_prompt_cache.call_count,2)
 
     def test_same_model_keeps_conditioning_cache(self):
         self.distinct_checkpoints()
@@ -330,6 +330,228 @@ class Tests(unittest.TestCase):
         with self.engine._checkpoint_session(self.p,'base'):
             pass
         self.p.clear_prompt_cache.assert_not_called()
+
+    def test_native_masks_are_not_refined_or_misindexed(self):
+        result=self.batch_result(2)
+        first,second=result.images
+        mask=object()
+        result.images=[first,mask,second]
+        self.p._pi_deferred_slots=[types.SimpleNamespace(image=first,index=0),types.SimpleNamespace(image=second,index=1)]
+        self.modules.processing.process_images.return_value.images=[types.SimpleNamespace(info={})]
+        self.engine._rewrite_saved=Mock()
+        self.engine._finish(self.p,result)
+        self.assertEqual(self.modules.processing.process_images.call_count,2)
+        self.assertIs(result.images[1],mask)
+        self.assertEqual([call.kwargs['seed'] for call in self.modules.processing.StableDiffusionProcessingImg2Img.call_args_list],[0,1])
+        self.assertNotIn('Refiner:',result.infotexts[1])
+        self.assertIn('Refiner:',result.infotexts[2])
+        self.assertIsNone(self.p._pi_deferred_slots)
+
+    def test_saved_grid_updated_when_not_returned_in_gallery(self):
+        result=self.batch_result(1)
+        self.p._pi_saved_grids=[123]
+        self.p._pi_saved_files={123:[('grid.png',None)]}
+        self.modules.processing.process_images.return_value.images=[types.SimpleNamespace(info={})]
+        grid=types.SimpleNamespace(info={})
+        self.modules.images=types.SimpleNamespace(image_grid=Mock(return_value=grid))
+        self.engine._rewrite_saved=Mock()
+        self.engine._finish(self.p,result)
+        self.assertEqual(len(result.images),1)
+        self.engine._rewrite_saved.assert_any_call(grid,result.info,[('grid.png',None)])
+
+    def test_no_grid_rebuild_when_refinement_fails(self):
+        result=self.batch_result(1)
+        result.images.insert(0,object())
+        result.index_of_first_image=1
+        self.modules.processing.process_images.side_effect=RuntimeError('unsupported model')
+        self.modules.images=types.SimpleNamespace(image_grid=Mock())
+        self.engine._finish(self.p,result)
+        self.modules.images.image_grid.assert_not_called()
+
+    def test_component_list_mutation_does_not_corrupt_loader_snapshot(self):
+        self.distinct_checkpoints()
+        self.modules.sd_models.model_data=types.SimpleNamespace(forge_loading_parameters={'additional_modules':['base-vae']})
+        with self.engine._checkpoint_session(self.p,'target'):
+            self.modules.sd_models.model_data.forge_loading_parameters['additional_modules'].append('target-encoder')
+        self.assertEqual(self.modules.sd_models.model_data.forge_loading_parameters['additional_modules'],['base-vae'])
+
+    def test_target_preset_dtype_reaches_loader_refresh(self):
+        self.distinct_checkpoints()
+        self.opts.data.update(forge_preset='base',forge_unet_storage_dtype_target='target-fp8')
+        def change(*args,**kwargs):
+            self.assertFalse(kwargs['refresh'])
+            self.opts.data.update(sd_model_checkpoint='target',forge_preset='target')
+        self.entry.checkpoint_change.side_effect=change
+        dtypes=[]
+        self.entry.refresh_model_loading_parameters.side_effect=lambda **kw:dtypes.append(self.opts.data['forge_unet_storage_dtype'])
+        with self.engine._checkpoint_session(self.p,'target'): pass
+        self.assertEqual(dtypes,['target-fp8'])
+        self.assertEqual(self.opts.data,{'sd_model_checkpoint':'base','forge_preset':'base','forge_unet_storage_dtype_target':'target-fp8'})
+
+    def test_unresolved_target_preset_does_not_inherit_source_dtype(self):
+        self.distinct_checkpoints()
+        self.opts.data.update(forge_preset='source',forge_unet_storage_dtype_source='forced-fp8')
+        with self.engine._checkpoint_session(self.p,'target'):
+            self.assertEqual(self.opts.data['forge_unet_storage_dtype'],'Automatic')
+
+    def test_backend_options_mutated_during_pass_are_restored(self):
+        self.distinct_checkpoints()
+        self.opts.data['existing']='original'
+        with self.engine._checkpoint_session(self.p,'target'):
+            self.opts.data['runtime-only']='new'
+            self.opts.data.pop('existing')
+        self.assertEqual(self.opts.data,{'sd_model_checkpoint':'base','existing':'original'})
+
+    def test_forward_nondefault_mask_and_image_guidance_settings(self):
+        mask=object()
+        self.p.image_mask=mask
+        settings=dict(mask_round=False,inpaint_full_res=False,inpaint_full_res_padding=48,
+                      initial_noise_multiplier=.7,latent_mask=object(),image_cfg_scale=2.5)
+        for key,value in settings.items(): setattr(self.p,key,value)
+        self.run_pass()
+        self.assertIs(self.job.image_mask,mask)
+        for key,value in settings.items():
+            if key=='image_cfg_scale':
+                self.assertEqual(self.modules.processing.StableDiffusionProcessingImg2Img.call_args.kwargs[key],value)
+            else: self.assertEqual(getattr(self.job,key),value)
+
+    def test_saved_image_and_sidecar_rollback_together(self):
+        import tempfile,os
+        from PIL import Image
+        self.modules.images=types.SimpleNamespace(save_image_with_geninfo=lambda image,info,filename,**kw:image.save(filename))
+        with tempfile.TemporaryDirectory() as folder:
+            image_path=Path(folder)/'image.png';text_path=Path(folder)/'image.txt'
+            Image.new('RGB',(4,4),'red').save(image_path);text_path.write_text('original')
+            before={p.name:p.read_bytes() for p in Path(folder).iterdir()}
+            replace=os.replace
+            count=0
+            def fail_second(source,target):
+                nonlocal count
+                count+=1
+                if count==2: raise OSError('second commit failed')
+                return replace(source,target)
+            with patch('os.replace',side_effect=fail_second):
+                with self.assertRaisesRegex(OSError,'second commit failed'):
+                    self.engine._rewrite_saved(Image.new('RGB',(4,4),'blue'),'new',[(str(image_path),str(text_path))])
+            self.assertEqual({p.name:p.read_bytes() for p in Path(folder).iterdir()},before)
+
+    def test_sidecar_staging_failure_does_not_change_image(self):
+        import tempfile
+        from PIL import Image
+        self.modules.images=types.SimpleNamespace(save_image_with_geninfo=lambda image,info,filename,**kw:image.save(filename))
+        with tempfile.TemporaryDirectory() as folder:
+            image_path=Path(folder)/'image.png';text_path=Path(folder)/'image.txt'
+            Image.new('RGB',(4,4),'red').save(image_path);text_path.write_text('original')
+            before={p.name:p.read_bytes() for p in Path(folder).iterdir()}
+            with patch.object(Path,'write_text',side_effect=OSError('text write failed')):
+                with self.assertRaisesRegex(OSError,'text write failed'):
+                    self.engine._rewrite_saved(Image.new('RGB',(4,4),'blue'),'new',[(str(image_path),str(text_path))])
+            self.assertEqual({p.name:p.read_bytes() for p in Path(folder).iterdir()},before)
+
+    def test_returned_grid_preserves_grid_text_and_excludes_masks(self):
+        result=self.batch_result(2)
+        first,second=result.images;mask=object();old_grid=object()
+        result.images=[old_grid,first,mask,second];result.index_of_first_image=1
+        result.info='GRID XYZ axes';result.infotexts=['GRID XYZ axes','sample first','sample second']
+        self.p._pi_deferred_slots=[types.SimpleNamespace(image=first,index=0),types.SimpleNamespace(image=second,index=1)]
+        self.modules.processing.process_images.side_effect=[types.SimpleNamespace(images=[types.SimpleNamespace(info={})],index_of_first_image=0) for _ in range(2)]
+        self.engine._rewrite_saved=Mock()
+        self.modules.images=types.SimpleNamespace(image_grid=Mock(return_value=types.SimpleNamespace(info={})))
+        self.engine._finish(self.p,result)
+        self.assertTrue(result.info.startswith('GRID XYZ axes'))
+        self.assertTrue(result.infotexts[0].startswith('GRID XYZ axes'))
+        self.assertTrue(result.infotexts[3].startswith('sample second'))
+        self.assertNotIn('Refiner:',result.infotexts[2])
+        grid_sources=self.modules.images.image_grid.call_args.args[0]
+        self.assertEqual(len(grid_sources),2)
+        self.assertNotIn(mask,grid_sources)
+
+    def test_stranded_wrapper_is_inactive_after_unload(self):
+        self.modules.scripts.ScriptRunner=type('Runner',(),{'run':lambda self,p,*args:None})
+        self.modules.images=types.SimpleNamespace(save_image=lambda image,*args,**kwargs:('sample.png',None))
+        original=self.modules.processing.process_images
+        self.engine._install_routes()
+        stranded=self.modules.processing.process_images
+        self.modules.processing.process_images=lambda p:stranded(p)
+        self.engine._unload()
+        self.engine._finish=Mock(side_effect=AssertionError('unloaded refiner ran'))
+        self.modules.processing.process_images(self.p)
+        original.assert_called_once_with(self.p)
+
+    def test_cross_batch_unloads_native_weights_and_clears_latents(self):
+        self.distinct_checkpoints()
+        self.modules.sd_models.unload_model_weights=Mock()
+        self.p._pi_external_finish=True
+        self.p.latents_after_sampling=[object()];self.p.hr_c=object();self.p.hr_uc=object()
+        with self.engine._checkpoint_session(self.p,'target'):
+            self.assertEqual(self.p.latents_after_sampling,[])
+            self.assertIsNone(self.p.hr_c)
+            self.assertIsNone(self.p.hr_uc)
+        self.assertEqual(self.modules.sd_models.unload_model_weights.call_count,2)
+
+    def test_later_success_does_not_hide_earlier_failure(self):
+        result=self.batch_result(2);first=result.images[0]
+        self.engine._rewrite_saved=Mock()
+        self.modules.processing.process_images.side_effect=[RuntimeError('first image failed'),types.SimpleNamespace(images=[types.SimpleNamespace(info={})],index_of_first_image=0)]
+        self.engine._finish(self.p,result)
+        self.assertIs(result.images[0],first)
+        self.assertIn('Image 1: first image failed',result.comments)
+
+    def test_transient_autolink_refresh_cannot_save_config(self):
+        self.distinct_checkpoints()
+        state=types.SimpleNamespace(checkpoint_change=False)
+        save=Mock()
+        def refresh(**kwargs):
+            if not state.checkpoint_change: save()
+        self.entry.refresh_model_loading_parameters.side_effect=refresh
+        with patch.dict(sys.modules,{'model_autolink.integration':types.SimpleNamespace(_state=state)}):
+            with self.engine._checkpoint_session(self.p,'target'): pass
+        save.assert_not_called()
+        self.assertFalse(state.checkpoint_change)
+
+    def test_saved_only_grid_keeps_its_own_infotext(self):
+        result=self.batch_result(1)
+        self.p._pi_saved_grids=[(123,'GRID own main prompt and axis settings')]
+        self.p._pi_saved_files={123:[('grid.png',None)]}
+        self.modules.processing.process_images.return_value.images=[types.SimpleNamespace(info={})]
+        grid=types.SimpleNamespace(info={})
+        self.modules.images=types.SimpleNamespace(image_grid=Mock(return_value=grid))
+        self.engine._rewrite_saved=Mock()
+        self.engine._finish(self.p,result)
+        grid_calls=[call for call in self.engine._rewrite_saved.call_args_list if call.args[0] is grid]
+        self.assertTrue(grid_calls[0].args[1].startswith('GRID own main prompt and axis settings'))
+        self.assertNotIn('Refiner error',grid_calls[0].args[1])
+
+    def test_save_capture_preserves_grid_info(self):
+        self.p._pi_saved_files={};self.p._pi_saved_grids=[]
+        def save(image,**kwargs): return ('grid.png',None)
+        self.engine._record_save(save,self.original,p=self.p,grid=True,info='GRID unique metadata')
+        self.assertEqual(self.p._pi_saved_grids,[(id(self.original),'GRID unique metadata')])
+
+    def test_stranded_native_setup_and_ui_are_inactive_after_unload(self):
+        wrapped_setup=self.native.setup;wrapped_ui=self.native.ui
+        original_ui=self.engine._original_uis[self.native]
+        self.native.setup=lambda *args,**kwargs:wrapped_setup(*args,**kwargs)
+        self.native.ui=lambda *args,**kwargs:wrapped_ui(*args,**kwargs)
+        self.engine._unload()
+        self.engine._setup=Mock(side_effect=AssertionError('inactive setup ran'))
+        self.engine._ui=Mock(side_effect=AssertionError('inactive UI ran'))
+        instance=self.native()
+        self.p._pi_refiner=None
+        instance.setup(self.p,True,'target',.75,0,'')
+        instance.ui(False)
+        self.original_setup.assert_called_once()
+        original_ui.assert_called_once()
+        self.assertIsNone(self.p._pi_refiner)
+
+    def test_completed_base_pixel_cache_released_without_dropping_gallery(self):
+        result=self.batch_result(2)
+        self.p.pixels_after_sampling=list(result.images)
+        self.modules.processing.process_images.return_value.images=[types.SimpleNamespace(info={})]
+        self.engine._rewrite_saved=Mock()
+        self.engine._finish(self.p,result)
+        self.assertEqual(self.p.pixels_after_sampling,[])
+        self.assertEqual(len(result.images),2)
 
 if __name__ == '__main__':
     unittest.main()
