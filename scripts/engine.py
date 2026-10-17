@@ -1,6 +1,7 @@
 """Use Forge Neo's native Refiner controls for a decoded-image second pass."""
 import copy
 import logging
+from contextlib import contextmanager, ExitStack
 from modules import scripts, script_callbacks, processing, shared, sd_models
 
 log = logging.getLogger('PI-Refiner')
@@ -33,7 +34,7 @@ def _ui(self, is_img2img):
                                label='Switch at', elem_id=self.elem_id('switch_at'),
                                info='1 skips refinement. Image-editing models may use their own strength.')
             cfg = gr.Slider(value=0, minimum=0, maximum=24, step=.5,
-                            label='Refiner CFG', elem_id=self.elem_id('cfg'), info='0 uses the base CFG.')
+                            label='Refiner CFG', elem_id=self.elem_id('cfg'), info='0 uses fast CFG 1. Higher values can cost more memory and time.')
         # Retain argument positions for existing presets, without a textbox.
         replacements = gr.State('')
     self.infotext_fields = [PasteField(enabled, lambda d: 'Refiner' in d),
@@ -63,6 +64,10 @@ class Script(scripts.Script):
         return []
 
     def postprocess_image_after_composite(self, p, pp, *args):
+        # Finish the base batch before changing models. This avoids reloading
+        # both models for every image, and never switches during a live sampler.
+        if getattr(p, '_pi_dispatching', False) and not getattr(p, '_pi_external_finish', False):
+            return
         if not getattr(p, '_pi_external_finish', False):
             p._pi_standard_callback = True
         spec = getattr(p, '_pi_refiner', None)
@@ -76,17 +81,14 @@ class Script(scripts.Script):
             p.extra_generation_params['Refiner error'] = 'Checkpoint unavailable: ' + checkpoint
             log.error('Checkpoint unavailable: %s', checkpoint)
             return
-        from modules_forge import main_entry
-        keys = ('sd_model_checkpoint', 'forge_additional_modules', 'forge_unet_storage_dtype', 'forge_preset')
-        options = {k: copy.deepcopy(shared.opts.data[k]) for k in keys if k in shared.opts.data}
         state_keys = ('job', 'job_no', 'job_count', 'sampling_step', 'sampling_steps',
                       'current_latent', 'current_image', 'id_live_preview')
         state = {k: getattr(shared.state, k) for k in state_keys if hasattr(shared.state, k)}
         job = None
+        session = ExitStack()
         p._pi_refining = True
         try:
-            _release_qwen_for_switch(checkpoint)
-            main_entry.checkpoint_change(checkpoint, preset=None, save=False, refresh=True)
+            session.enter_context(_checkpoint_session(p, checkpoint))
             log.info('Refining image %s with %s (strength %.3f)', pp.index + 1, checkpoint, strength)
             print(f'[PI-Refiner] Refining image {pp.index + 1}: {checkpoint}')
             i = pp.index
@@ -95,11 +97,14 @@ class Script(scripts.Script):
                 prompt=_prompt(_value(p, 'all_prompts', i, p.prompt)),
                 negative_prompt=_value(p, 'all_negative_prompts', i, p.negative_prompt),
                 seed=_value(p, 'all_seeds', i, p.seed), subseed=_value(p, 'all_subseeds', i, p.subseed),
-                subseed_strength=p.subseed_strength, steps=p.steps, denoising_strength=strength,
-                cfg_scale=cfg if cfg is not None and cfg >= 1 else p.cfg_scale,
-                distilled_cfg_scale=p.distilled_cfg_scale, sampler_name=p.sampler_name,
-                scheduler=p.scheduler, batch_size=1, n_iter=1,
-                do_not_save_samples=True, do_not_save_grid=True)
+                subseed_strength=p.subseed_strength, steps=_fast_steps(p, strength), denoising_strength=strength,
+                cfg_scale=cfg if cfg is not None and cfg >= 1 else 1.0,
+                distilled_cfg_scale=_target_setting(p, 'dcfg', p.distilled_cfg_scale),
+                sampler_name=_target_setting(p, 'sampler', p.sampler_name),
+                scheduler=_target_setting(p, 'scheduler', p.scheduler), batch_size=1, n_iter=1,
+                restore_faces=False, do_not_reload_embeddings=True,
+                do_not_save_samples=True, do_not_save_grid=True,
+                override_settings={'img2img_fix_steps': True, 'live_previews_enable': False})
             # Preserve the full-resolution inpainting mask where supplied.
             mask = getattr(p, 'image_mask', None)
             if mask is not None:
@@ -120,7 +125,8 @@ class Script(scripts.Script):
             pp.image = output.images[first]
             p.extra_generation_params.pop('Refiner error', None)
             p.extra_generation_params.update({'Refiner': checkpoint,
-                'Refiner switch at': switch, 'Refiner denoising strength': strength, 'Refiner CFG scale': job.cfg_scale})
+                'Refiner switch at': switch, 'Refiner denoising strength': strength,
+                'Refiner CFG scale': job.cfg_scale, 'Refiner steps': job.steps})
         except Exception as exc:
             p.extra_generation_params['Refiner error'] = str(exc)
             log.exception('Refinement failed; retaining original image')
@@ -130,15 +136,7 @@ class Script(scripts.Script):
                     job.close()
             finally:
                 try:
-                    _release_qwen_for_switch(options.get('sd_model_checkpoint'))
-                    for key in keys:
-                        if key in options:
-                            shared.opts.data[key] = options[key]
-                        else:
-                            shared.opts.data.pop(key, None)
-                    main_entry.refresh_model_loading_parameters(refresh=True)
-                    if not getattr(p, '_pi_external_finish', False):
-                        sd_models.forge_model_reload()
+                    session.close()
                 finally:
                     for key, value in state.items():
                         setattr(shared.state, key, value)
@@ -177,15 +175,121 @@ def _unload():
 
 script_callbacks.on_script_unloaded(_unload)
 
-def _release_qwen_for_switch(checkpoint):
-    # Qwen's isolated worker owns memory outside Forge's model manager.
+def _release_for_switch(checkpoint):
+    """Release loaded external engines; native engines stay Forge-managed."""
     import sys
-    runtime = sys.modules.get('pi_qwen21.lib.runtime')
-    if runtime is None or getattr(runtime, '_pipe', None) is None:
-        return
     current = shared.opts.data.get('sd_model_checkpoint')
-    if sd_models.get_closet_checkpoint_match(current) != sd_models.get_closet_checkpoint_match(checkpoint):
-        runtime.release()
+    if sd_models.get_closet_checkpoint_match(current) == sd_models.get_closet_checkpoint_match(checkpoint):
+        return
+    for name in ('pi_qwen21.lib.runtime', 'pi_boogu_image.lib.pipeline',
+                 'pi_sensenova.run', 'pi_h3.runtime'):
+        runtime = sys.modules.get(name)
+        release = getattr(runtime, 'release', None)
+        if callable(release):
+            release()
+
+
+def _preflight(checkpoint):
+    import sys
+    info = sd_models.get_closet_checkpoint_match(checkpoint)
+    if info is None:
+        raise ValueError('Checkpoint unavailable: ' + str(checkpoint))
+    if getattr(info, 'refiner_supports_img2img', None) is False:
+        raise ValueError('This checkpoint cannot accept images; select an image-editing checkpoint.')
+    boogu = sys.modules.get('pi_boogu_image.forge')
+    if boogu is not None:
+        asset = boogu.selected(name=checkpoint)
+        if asset is not None and 'edit' not in asset.trunk:
+            raise ValueError('Boogu Base/Turbo cannot refine images. Select Boogu Edit or Edit-Turbo.')
+    # Do not gate by filename, bit width, or format. Forge/the backend owns
+    # NVFP4, ConvRot, GGUF, FP8 and future-format capability checks.
+    return info
+
+
+def _target_setting(p, suffix, fallback):
+    if not getattr(p, '_pi_changed_preset', False):
+        return fallback
+    preset = shared.opts.data.get('forge_preset')
+    value = shared.opts.data.get(f'{preset}_i2i_{suffix}')
+    return fallback if value is None else value
+
+
+def _fast_steps(p, strength):
+    import math
+    base = max(1, int(_target_setting(p, 'step', p.steps)))
+    return min(base, 8, max(2, math.ceil(base * strength)))
+
+
+def _release_base_conditioning(p):
+    # All base sampling/postprocessing has returned; these GPU references are
+    # no longer needed. Keep PIL source images and masks for refinement.
+    for name in ('sampler', 'c', 'uc', 'init_latent', 'image_conditioning'):
+        if hasattr(p, name):
+            setattr(p, name, None)
+    clear = getattr(p, 'clear_prompt_cache', None)
+    if callable(clear):
+        clear()
+    if hasattr(shared.state, 'current_latent'):
+        shared.state.current_latent = None
+
+
+@contextmanager
+def _checkpoint_session(p, checkpoint):
+    """One target switch per batch, exact option rollback, no eager base load."""
+    if getattr(p, '_pi_active_checkpoint', None) == checkpoint:
+        yield
+        return
+    from modules_forge import main_entry
+    target = _preflight(checkpoint)
+    options = copy.deepcopy(shared.opts.data)
+    original_info = sd_models.get_closet_checkpoint_match(options.get('sd_model_checkpoint'))
+    switched = original_info != target
+    model_data = getattr(sd_models, 'model_data', None)
+    loading = copy.copy(getattr(model_data, 'forge_loading_parameters', None))
+    dynamic = getattr(main_entry, 'dynamic_args', None)
+    online_lora = getattr(dynamic, 'online_lora', None)
+    restore_keys = set()
+    try:
+        if switched:
+            if getattr(p, '_pi_external_finish', False):
+                _release_base_conditioning(p)
+            _release_for_switch(checkpoint)
+            try:
+                # Packed target weights must not inherit the source model's
+                # forced FP8/FP16 storage conversion setting.
+                shared.opts.data['forge_unet_storage_dtype'] = 'Automatic'
+                main_entry.checkpoint_change(checkpoint, preset=None, save=False, refresh=True)
+            finally:
+                # Autolink can also change per-family module and preset keys.
+                restore_keys = {key for key in options.keys() | shared.opts.data.keys()
+                                if options.get(key) != shared.opts.data.get(key)
+                                or (key in options) != (key in shared.opts.data)}
+        p._pi_active_checkpoint = checkpoint
+        p._pi_changed_preset = options.get('forge_preset') != shared.opts.data.get('forge_preset')
+        yield
+    finally:
+        try:
+            if switched:
+                try:
+                    _release_for_switch(options.get('sd_model_checkpoint'))
+                finally:
+                    for key in restore_keys:
+                        if key in options:
+                            shared.opts.data[key] = options[key]
+                        else:
+                            shared.opts.data.pop(key, None)
+                    if model_data is not None and loading is not None:
+                        model_data.forge_loading_parameters = loading
+                    if dynamic is not None and online_lora is not None:
+                        dynamic.online_lora = online_lora
+                    # Restore without calling Autolink's persistence/refresh
+                    # hook. The next normal job loads the base on demand.
+                    processing.need_global_unload = True
+                    if not getattr(p, '_pi_external_finish', False):
+                        sd_models.forge_model_reload()
+        finally:
+            p._pi_active_checkpoint = None
+            p._pi_changed_preset = False
 
 
 class _OptionsOnlyRunner:
@@ -217,9 +321,13 @@ def _arm(p, runner=None, ui_args=None):
 
 
 def _record_save(original, image, *args, **kwargs):
-    import inspect
-    bound = inspect.signature(original).bind_partial(image, *args, **kwargs)
-    p = bound.arguments.get('p')
+    p = kwargs.get('p')
+    if p is None:
+        import inspect
+        try:
+            p = inspect.signature(original).bind_partial(image, *args, **kwargs).arguments.get('p')
+        except (TypeError, ValueError):
+            p = None
     result = original(image, *args, **kwargs)
     records = getattr(p, '_pi_saved_files', None)
     if records is not None and not getattr(p, '_pi_refining', False) and result and result[0]:
@@ -248,6 +356,26 @@ def _rewrite_saved(image, info, records):
 
 
 def _finish(p, result):
+    spec = getattr(p, '_pi_refiner', None)
+    if (result is None or not spec or not getattr(result, 'images', None)
+            or getattr(p, '_pi_standard_callback', False) or float(spec[1]) >= 1
+            or shared.state.interrupted or shared.state.skipped
+            or getattr(shared.state, 'stopping_generation', False)):
+        return result
+    p._pi_external_finish = True
+    try:
+        with _checkpoint_session(p, spec[0]):
+            return _finish_images(p, result)
+    except Exception as exc:
+        p.extra_generation_params['Refiner error'] = str(exc)
+        result.comments = (getattr(result, 'comments', '') or '') + '\nRefiner failed: ' + str(exc)
+        log.exception('Refinement session failed; generated images retained')
+        return result
+    finally:
+        p._pi_external_finish = False
+
+
+def _finish_images(p, result):
     if result is None or getattr(p, '_pi_standard_callback', False):
         return result
     samples = getattr(result, 'images', None)
@@ -258,7 +386,6 @@ def _finish(p, result):
     # Takeover engines may construct their own prompts/seeds without filling p.
     old = {k: (hasattr(p, k), getattr(p, k, None)) for k in
            ('all_prompts', 'all_negative_prompts', 'all_seeds', 'all_subseeds')}
-    p._pi_external_finish = True
     try:
         for key in old:
             values = getattr(result, key, None)
@@ -302,7 +429,6 @@ def _finish(p, result):
             result.comments = (getattr(result, 'comments', '') or '') + '\nRefiner failed: ' + error
         return result
     finally:
-        p._pi_external_finish = False
         for key, (existed, value) in old.items():
             if existed:
                 setattr(p, key, value)
