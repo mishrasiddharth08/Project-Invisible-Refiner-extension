@@ -1,12 +1,7 @@
 import sys
-from pathlib import Path
 
-required = '3.10'
-try:
-    if sys.version_info < (3, 10):
-        raise RuntimeError(f'Python {required}+ is required')
-except AttributeError:
-    pass
+if sys.version_info < (3, 10):
+    raise RuntimeError('Python 3.10+ is required')
 
-print('PROJECT INVISIBLE — Universal Refiner: no extra dependencies required.')
-print('It reuses the checkpoint already loaded by Forge; nothing else is installed.')
+print('PROJECT INVISIBLE - Refiner: no automatic dependency installation.')
+print('Optional DLSS uses a separately supplied Visual Enhancer runtime; see docs/DLSS5.md.')
