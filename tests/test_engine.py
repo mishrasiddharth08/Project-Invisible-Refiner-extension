@@ -596,5 +596,211 @@ class Tests(unittest.TestCase):
         self.entry.checkpoint_change.assert_not_called()
         self.assertIn('acknowledgement',result.comments)
 
+    def fibo_modules(self, variant='edit-turbo'):
+        contract = types.SimpleNamespace(is_fibo2_checkpoint=lambda name: True, validate_request=Mock())
+        runtime = types.SimpleNamespace(_validate_metadata=lambda *args: ({'verified_official_variant':variant}, []))
+        self.modules.sd_models.get_closet_checkpoint_match.return_value = types.SimpleNamespace(filename='packed.safetensors')
+        self.p.width, self.p.height = 768, 512
+        return {'forge_fibo2.contract':contract, 'forge_fibo2.runtime':runtime}
+
+    def test_fibo_reference_uses_native_recipe_and_keeps_metadata(self):
+        modules = self.fibo_modules()
+        self.job.override_settings = {}
+        self.modules.processing.process_images.return_value.extra_generation_params = {'FIBO precision':'int8_convrot'}
+        with patch.dict(sys.modules, modules):
+            self.run_pass()
+        args = self.modules.processing.StableDiffusionProcessingImg2Img.call_args.kwargs
+        self.assertEqual((args['steps'], args['cfg_scale'], args['sampler_name'], args['scheduler']), (4, 1, 'Euler', 'Simple'))
+        self.assertIs(args['init_images'][0], self.original)
+        self.assertEqual(self.job.override_settings['sd_vae_decode_method'], 'Full')
+        self.assertEqual(modules['forge_fibo2.contract'].validate_request.call_count, 2)
+        self.assertEqual(self.p.extra_generation_params['Refiner FIBO precision'], 'int8_convrot')
+        self.assertNotIn('Refiner denoising strength', self.p.extra_generation_params)
+
+    def test_fibo_dev_has_its_own_cfg_and_step_defaults(self):
+        modules = self.fibo_modules('dev')
+        with patch.dict(sys.modules, modules):
+            profile = self.engine._target_profile('target', self.modules.sd_models.get_closet_checkpoint_match())
+        self.p._pi_target_profile = profile
+        self.assertEqual(profile['preset'], 'fibo2_dev')
+        self.assertEqual(self.engine._target_cfg(self.p, 0), 5)
+        self.assertEqual(self.engine._fast_steps(self.p, .25), 30)
+
+    def test_fibo_cold_start_imports_enabled_runtime(self):
+        modules = self.fibo_modules()
+        runtime = modules.pop('forge_fibo2.runtime')
+        modules['forge_fibo2.runtime'] = None
+        with patch.dict(sys.modules, modules), patch('importlib.import_module', return_value=runtime) as load:
+            profile = self.engine._target_profile('target', types.SimpleNamespace(filename='packed.safetensors'))
+        load.assert_called_once_with('forge_fibo2.runtime')
+        self.assertEqual(profile['steps'], 4)
+
+    def test_refiner_runner_binds_target_fibo_without_rerunning_base_scripts(self):
+        unrelated = types.SimpleNamespace(process=Mock())
+        runner = self.engine._OptionsOnlyRunner(types.SimpleNamespace(alwayson_scripts=[unrelated]))
+        model = types.SimpleNamespace(is_fibo2=True, bind=Mock())
+        self.p.sd_model = model
+        def generate(job):
+            job.sd_model = model
+            job.scripts.process(job)
+            return types.SimpleNamespace(images=[self.output])
+        self.p.scripts = types.SimpleNamespace(alwayson_scripts=[unrelated])
+        self.modules.processing.process_images.side_effect = generate
+        self.run_pass()
+        model.bind.assert_called_once_with(self.job)
+        unrelated.process.assert_not_called()
+        self.assertIs(self.pp.image, self.output)
+
+    def test_refiner_runner_preserves_fibo_masked_alpha_callback(self):
+        self.p.sd_model = types.SimpleNamespace(is_fibo2=True)
+        self.p._fibo2_edit_context = object()
+        restore = Mock(return_value=self.output)
+        with patch.dict(sys.modules, {'forge_fibo2.editing':types.SimpleNamespace(restore_masked_alpha=restore)}):
+            self.engine._OptionsOnlyRunner(None).postprocess_image_after_composite(self.p, self.pp)
+        restore.assert_called_once_with(self.original, self.p._fibo2_edit_context)
+        self.assertIs(self.pp.image, self.output)
+
+    def test_refiner_runner_leaves_other_model_lifecycle_alone(self):
+        model = types.SimpleNamespace(bind=Mock())
+        self.p.sd_model = model
+        self.engine._OptionsOnlyRunner(None).process(self.p)
+        model.bind.assert_not_called()
+
+    def test_fibo_rejects_inherited_negative_before_model_switch(self):
+        modules = self.fibo_modules()
+        self.p.negative_prompt = 'base negative'
+        with patch.dict(sys.modules, modules):
+            self.run_pass()
+        self.entry.checkpoint_change.assert_not_called()
+        self.modules.processing.process_images.assert_not_called()
+        self.assertIs(self.pp.image, self.original)
+        self.assertIn('empty target negative', self.p.extra_generation_params['Refiner error'])
+
+    def test_fibo_explicit_target_negative_preserves_base_negative(self):
+        modules = self.fibo_modules()
+        self.p.negative_prompt = 'base negative'
+        self.p._pi_refiner_text = ('refine details', '')
+        self.job.override_settings = {}
+        with patch.dict(sys.modules, modules):
+            self.run_pass()
+        args = self.modules.processing.StableDiffusionProcessingImg2Img.call_args.kwargs
+        self.assertEqual((args['prompt'], args['negative_prompt']), ('refine details', ''))
+        self.assertEqual(self.p.negative_prompt, 'base negative')
+
+    def test_qwen_and_klein_resolve_target_components_without_persistence(self):
+        for family, preset in [('qwen_image21', 'qwen21'), ('flux2_klein4', 'klein'), ('flux2_klein9', 'klein')]:
+            resolver = types.SimpleNamespace(
+                checkpoint=Mock(return_value=(None, types.SimpleNamespace(label=family))),
+                resolve=Mock(return_value=(['target-te', 'target-vae'], family, 'saved')))
+            integration = types.SimpleNamespace(_resolver=resolver)
+            with patch.dict(sys.modules, {'model_autolink.integration':integration}):
+                profile = self.engine._target_profile('target', types.SimpleNamespace(filename='model.safetensors'))
+            self.assertEqual(profile['preset'], preset)
+            self.assertEqual(profile['modules'], ['target-te', 'target-vae'])
+            resolver.resolve.assert_called_once_with('model.safetensors', persist=False)
+
+    def test_missing_target_components_fail_before_unloading_base(self):
+        resolver = types.SimpleNamespace(
+            checkpoint=lambda *args: (None, types.SimpleNamespace(label='qwen_image21')),
+            resolve=Mock(side_effect=RuntimeError('matching VAE missing')))
+        self.modules.sd_models.get_closet_checkpoint_match.return_value = types.SimpleNamespace(filename='model.safetensors')
+        with patch.dict(sys.modules, {'model_autolink.integration':types.SimpleNamespace(_resolver=resolver)}):
+            self.run_pass()
+        self.entry.checkpoint_change.assert_not_called()
+        self.assertIn('matching VAE missing', self.p.extra_generation_params['Refiner error'])
+
+    def test_native_saved_presets_work_without_autolink(self):
+        info = types.SimpleNamespace(filename='native.safetensors')
+        self.modules.sd_models.get_closet_checkpoint_match.return_value = info
+        for preset in ('qwen21', 'klein'):
+            self.opts.data = {'forge_checkpoint_' + preset:'saved alias',
+                              'forge_additional_modules_' + preset:['native-te', 'native-vae']}
+            with patch.dict(sys.modules, {'model_autolink.integration':None}):
+                profile = self.engine._target_profile('target', info)
+            self.assertEqual(profile['preset'], preset)
+            self.assertEqual(profile['modules'], ['native-te', 'native-vae'])
+
+    def test_missing_native_saved_components_fail_before_switch(self):
+        info = types.SimpleNamespace(filename='native.safetensors')
+        self.modules.sd_models.get_closet_checkpoint_match.return_value = info
+        self.opts.data['forge_checkpoint_qwen21'] = 'saved alias'
+        with patch.dict(sys.modules, {'model_autolink.integration':None}):
+            self.run_pass()
+        self.entry.checkpoint_change.assert_not_called()
+        self.assertIs(self.pp.image, self.original)
+        self.assertIn('matching text encoder/VAE', self.p.extra_generation_params['Refiner error'])
+
+    def test_mask_blur_axes_reach_target_job(self):
+        self.p.image_mask = object()
+        self.p.mask_blur_x, self.p.mask_blur_y = 3, 9
+        self.run_pass()
+        self.assertEqual((self.job.mask_blur_x, self.job.mask_blur_y), (3, 9))
+
+    def test_qwen_native_session_uses_target_modules_then_restores_base(self):
+        self.distinct_checkpoints()
+        lookup = self.modules.sd_models.get_closet_checkpoint_match.side_effect
+        def info(name):
+            result = lookup(name)
+            result.filename = str(name) + '.safetensors'
+            return result
+        self.modules.sd_models.get_closet_checkpoint_match.side_effect = info
+        resolver = types.SimpleNamespace(
+            checkpoint=lambda *args: (None, types.SimpleNamespace(label='qwen_image21')),
+            resolve=lambda *args, **kwargs: (['qwen-te', 'qwen-vae'], 'qwen_image21', 'saved'))
+        original = dict(self.opts.data)
+        with patch.dict(sys.modules, {'model_autolink.integration':types.SimpleNamespace(_resolver=resolver)}):
+            with self.engine._checkpoint_session(self.p, 'target'):
+                self.assertEqual(self.opts.data['forge_preset'], 'qwen21')
+                self.assertEqual(self.opts.data['forge_additional_modules'], ['qwen-te', 'qwen-vae'])
+                self.assertEqual(self.engine._target_setting(self.p, 'sampler', 'foreign-sampler'), 'Euler')
+        self.assertEqual(self.opts.data, original)
+
+    def test_fibo_worker_released_when_switching_away(self):
+        self.distinct_checkpoints()
+        release = Mock()
+        with patch.dict(sys.modules, {'forge_fibo2.engine':types.SimpleNamespace(release_current=release)}):
+            self.engine._release_for_switch('target')
+        release.assert_called_once()
+
+    def test_moss_profile_uses_native_scheduler_cfg_and_bounded_steps(self):
+        info = types.SimpleNamespace(filename='moss-packed.safetensors')
+        self.modules.sd_models.get_closet_checkpoint_match.return_value = info
+        self.opts.data.update(forge_additional_modules_moss=['moss-te', 'flux2-vae'])
+        with patch.dict(sys.modules, {'forge_moss.native.assets':types.SimpleNamespace(valid_checkpoint=lambda path: True), 'model_autolink.integration':None}):
+            profile = self.engine._target_profile('target', info)
+        self.p._pi_target_profile = profile
+        self.assertEqual((profile['preset'], profile['scheduler'], profile['modules']), ('moss', 'MOSS', ['moss-te', 'flux2-vae']))
+        self.assertEqual(self.engine._target_cfg(self.p, 0), 3)
+        self.assertEqual(self.engine._fast_steps(self.p, .25), 8)
+
+    def test_moss_missing_backend_fails_before_switch(self):
+        self.engine._target_profile = lambda *args: {'family':'moss_image'}
+        with patch.dict(sys.modules, {'forge_moss.native.patches':None}):
+            self.run_pass()
+        self.entry.checkpoint_change.assert_not_called()
+        self.assertIn('MOSS backend is unavailable', self.p.extra_generation_params['Refiner error'])
+
+    def test_moss_spectrum_forwards_only_owner_hooks(self):
+        calls = []
+        session = object()
+        scope = {'Session':session, 'calls':calls}
+        exec('class Spectrum:\n def process_before_every_sampling(self,p,**kwargs): calls.append("sampling")\n def postprocess_batch(self,p,*args,**kwargs): calls.append("batch")\n def postprocess(self,p,*args): calls.append("done")', scope)
+        unrelated = types.SimpleNamespace(process_before_every_sampling=Mock())
+        runner = self.engine._OptionsOnlyRunner(types.SimpleNamespace(alwayson_scripts=[scope['Spectrum'](), unrelated]))
+        self.p.sd_model = types.SimpleNamespace(is_moss_image=True)
+        with patch.dict(sys.modules, {'forge_moss.native.spectrum':types.SimpleNamespace(Session=session)}):
+            runner.process_before_every_sampling(self.p)
+            runner.postprocess_batch(self.p)
+            runner.postprocess(self.p, None)
+            self.p.sd_model.is_moss_image = False
+            runner.process_before_every_sampling(self.p)
+        self.assertEqual(calls, ['sampling', 'batch', 'done'])
+        unrelated.process_before_every_sampling.assert_not_called()
+
+    def test_moss_actual_spectrum_metadata_is_reported(self):
+        self.modules.processing.process_images.return_value.extra_generation_params = {'MOSS Spectrum':'Off (no forecast qualified)', 'MOSS Spectrum calls':'8 real, 0 forecast, 0 rejected'}
+        self.run_pass()
+        self.assertEqual(self.p.extra_generation_params['Refiner MOSS Spectrum calls'], '8 real, 0 forecast, 0 rejected')
+
 if __name__ == '__main__':
     unittest.main()

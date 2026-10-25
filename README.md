@@ -16,7 +16,7 @@ The extension replaces the native mid-sampling latent switch with a separate ima
 Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, are forwarded. The LoRA rules textbox and explanatory panel are removed; prompt LoRAs are left unchanged. Use LoRAs compatible with the receiving model.
 
 ## Testing status
-For this publication, all 81 mocked CPU regression tests passed. The October 22 implementation task also recorded those tests passing.
+For this publication, all 100 CPU regression tests passed, including existing DLSS coverage and the new model routing/lifecycle checks. These tests do not establish real-weight GPU compatibility.
 It also recorded a live RTX 5090/Qwen 2.1 INT8 ConvRot generation with changed
 pixels and matching saved/gallery output, an Extras upload/save check preserving
 size, alpha and generation parameters, and five distinct existing-image outputs
@@ -57,7 +57,7 @@ Any base can hand off decoded pixels, but the target must actually accept images
 Forge Neo's upstream supported-format list is maintained in its [README](https://github.com/Haoming02/sd-webui-forge-classic/blob/neo/README.md). NVIDIA describes [NVFP4](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/) as a distinct floating-point format; it is not interchangeable with integer INT4. A filename alone is not evidence that a checkpoint's encoding, model architecture, and kernels are compatible.
 
 ## Speed and strength
-Use **Switch at** as the preserved base-image fraction: 0.75 means 0.25 denoising; 1 means no refinement. This extension interprets it as a fraction even when native Forge is configured for sigma switching. Refinement uses a speed-first budget: ceil(base or target preset steps times denoising strength), normally 2 to 8 steps, or 1 if the source requests 1. Native img2img uses fixed refinement steps so denoising does not reduce this budget a second time. CFG 0 automatically uses CFG 1 to reduce guidance work; an explicit CFG of 1 or higher is respected. Stock live previews, repeated face restoration, and embedding rescans are disabled for the refinement pass. These shortcuts can reduce image quality. Reference-image editing models such as Qwen 2.1 use their native image guidance and may not honor an img2img denoising fraction; a value of 1 always skips the pass. The LoRA rules UI is removed.
+Use **Switch at** as the preserved base-image fraction: 0.75 means 0.25 denoising; 1 means no refinement. This extension interprets it as a fraction even when native Forge is configured for sigma switching. Refinement uses a speed-first budget: ceil(base or target preset steps times denoising strength), normally 2 to 8 steps, or 1 if the source requests 1. Native img2img uses fixed refinement steps so denoising does not reduce this budget a second time. CFG 0 uses the target default (normally 1; saved MOSS CFG defaults to 3, FIBO 2.0 Dev uses 5) to reduce guidance work; an explicit CFG of 1 or higher is respected. Stock live previews, repeated face restoration, and embedding rescans are disabled for the refinement pass. These shortcuts can reduce image quality. Reference-image editing models such as Qwen 2.1 use their native image guidance and may not honor an img2img denoising fraction; a value of 1 always skips the pass. The LoRA rules UI is removed.
 
 ## Image honesty
 Refinement can change text, faces, and details. Metadata records the target, strength, and CFG. Inspect output quality before relying on a pairing.
@@ -106,6 +106,55 @@ This extension is independent and unofficial. It is not an official product of a
 ## A humble note from the author
 
 This is a first public attempt by a non-programmer learning through experimentation and community help. Please forgive mistakes. Constructive feedback, patient explanations and complete error reports are welcomed with gratitude.
+
+## FIBO 2.0, Qwen 2.1, Klein and MOSS refiner routes
+
+Select the target in the existing **Refiner** checkpoint dropdown. The decoded
+base image goes through the target's own Forge image-input route. Forge core,
+model loaders, precision handling and model licenses remain owned by their
+respective projects. Matching encoders/VAE are resolved by installed Model
+Autolink. Without Autolink, Qwen/Klein use the checkpoint and components saved
+in their native UI Preset; configure that preset first. Missing saved components
+fail before unloading the base model.
+
+- **FIBO 2.0 Edit Turbo:** native reference editing, 4 steps, CFG 1, Euler/Simple.
+  Leave Refiner CFG and target steps at 0 for these defaults. Use separate target
+  prompts with an empty negative if the base needs a negative prompt. Unsupported
+  LoRAs, variation seeds, dimensions or recipes fail clearly and retain the base.
+- **FIBO 2.0 Dev:** native reference route, 30 steps and CFG 5 defaults; its own
+  engine validates the request. These defaults preserve its existing recipe.
+- **Qwen 2.1 / FLUX.2 Klein:** use their native img2img engines, compatible
+  components and saved target preset sampling settings. Reference-mode options
+  retain their existing Forge behavior. Refinement keeps the bounded step budget.
+- **FLUX.3 Klein:** keeps the existing full-frame reference route, acknowledgement
+  requirements, target prompt separation and model-specific step defaults.
+
+FIBO and FLUX.3 reference editing do not use a denoising fraction; **Switch at=1**
+still skips refinement. FIBO metadata records actual precision and memory policy;
+its worker is released when changing checkpoints. One target session is shared
+across a batch, while images are refined individually to limit peak memory.
+
+FIBO's required model binding and masked-alpha restoration remain active in the
+second pass; unrelated base processing scripts are not rerun. Its runtime can
+load on the first refiner request after starting Forge with another checkpoint.
+
+**MOSS-Image:** uses native img2img with its matching Qwen3.5 encoder and FLUX.2
+VAE, Euler/MOSS scheduler, saved target sampling preferences, and CFG 3 by default.
+Select a MOSS checkpoint in the same Refiner dropdown. Switch at controls actual
+img2img denoising; the normal bounded refinement budget applies. Its native backend
+must be enabled at startup. Missing backend/components fail before unloading the base.
+The selected MOSS Spectrum setting is preserved with its own sampling and cleanup
+hooks. Default short passes do not qualify for forecasting; eligible Balanced runs
+need at least 17 target steps and Euler/MOSS. Actual MOSS timing/call/cache metadata
+is included; no extra acceleration is silently enabled.
+
+Validation: all 100 repository CPU tests passed (87 refiner routing/lifecycle tests plus DLSS coverage). Full-weight cross-model images,
+quality, speed, VRAM use and every quantization combination remain unverified.
+Only formats supported by the selected model's installed loader can work.
+
+Install the corresponding model extension first: this repository adds the refiner
+connection, not the FIBO, FLUX3 or MOSS backend itself. MOSS requires the
+Project Invisible MOSS-Image Forge Neo extension. Restart Forge after updating.
 
 ## Special Thanks
 

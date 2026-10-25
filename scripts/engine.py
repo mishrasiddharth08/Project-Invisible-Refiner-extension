@@ -55,9 +55,9 @@ def _ui(self, is_img2img):
         with gr.Row():
             switch = gr.Slider(value=.75, minimum=0, maximum=1, step=.025,
                                label='Switch at', elem_id=self.elem_id('switch_at'),
-                               info='1 skips refinement. DLSS 5 uses 1 minus this value as enhancement intensity; CFG is unused. FLUX3 uses full-image reference conditioning.')
+                               info='1 skips refinement. FIBO 2.0 and FLUX3 use image references rather than denoising strength. DLSS 5 uses 1 minus this value as enhancement intensity.')
             cfg = gr.Slider(value=0, minimum=0, maximum=24, step=.5,
-                            label='Refiner CFG', elem_id=self.elem_id('cfg'), info='Below 1 uses fast CFG 1. Higher values can cost more memory and time.')
+                            label='Refiner CFG', elem_id=self.elem_id('cfg'), info='0 selects the target default: usually 1; MOSS uses its saved CFG (default 3), FIBO 2.0 Dev uses 5.')
         # Retain argument positions for existing presets, without a textbox.
         replacements = gr.State('')
         with gr.Accordion('Refiner target settings', open=False):
@@ -68,7 +68,7 @@ def _ui(self, is_img2img):
             target_negative = gr.Textbox(value='', label='Refiner negative prompt', lines=2)
             target_steps = gr.Slider(value=0, minimum=0, maximum=100, step=1,
                 label='Refiner steps (0 = target default)',
-                info='FLUX3 defaults to16 distilled flow-map steps or25 Base CFG steps, independent of Switch at. Other targets retain their bounded native refinement step policy.')
+                info='Defaults: FIBO Turbo 4, FIBO Dev 30; FLUX3 distilled 16 or Base 25. Other targets use a bounded native refinement budget.')
     self.infotext_fields = [PasteField(enabled, lambda d: 'Refiner' in d),
         PasteField(checkpoint, 'Refiner', api='refiner_checkpoint'),
         PasteField(switch, 'Refiner switch at', api='refiner_switch_at'),
@@ -87,7 +87,7 @@ def _prompt(prompt):
 
 class Script(scripts.Script):
     def title(self):
-        return 'PROJECT INVISIBLE - Refiner'
+        return 'PROJECT INVISIBLE — Refiner'
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
@@ -156,7 +156,7 @@ class Script(scripts.Script):
                 negative_prompt=_target_text(p, i)[1],
                 seed=_value(p, 'all_seeds', i, p.seed), subseed=_value(p, 'all_subseeds', i, p.subseed),
                 subseed_strength=p.subseed_strength, steps=_fast_steps(p, strength), denoising_strength=strength,
-                cfg_scale=cfg if cfg is not None and cfg >= 1 else 1.0,
+                cfg_scale=_target_cfg(p, cfg),
                 image_cfg_scale=getattr(p, 'image_cfg_scale', None),
                 distilled_cfg_scale=_target_setting(p, 'dcfg', p.distilled_cfg_scale),
                 sampler_name=_target_setting(p, 'sampler', p.sampler_name),
@@ -168,7 +168,7 @@ class Script(scripts.Script):
             mask = getattr(p, 'image_mask', None)
             if mask is not None:
                 job.image_mask = mask
-                for name in ('inpainting_mask_invert', 'mask_blur', 'inpainting_fill',
+                for name in ('inpainting_mask_invert', 'mask_blur', 'mask_blur_x', 'mask_blur_y', 'inpainting_fill',
                              'mask_round', 'inpaint_full_res', 'inpaint_full_res_padding',
                              'initial_noise_multiplier', 'latent_mask'):
                     if hasattr(p, name):
@@ -177,6 +177,12 @@ class Script(scripts.Script):
             job.scripts = _OptionsOnlyRunner(getattr(p, 'scripts', None))
             job.script_args = getattr(p, 'script_args', ())
             job.disable_extra_networks = getattr(p, 'disable_extra_networks', False)
+            profile = getattr(p, '_pi_target_profile', None) or {}
+            if profile.get('family') == 'fibo2':
+                # Let the owning engine validate its exact recipe; no host edits.
+                import sys
+                sys.modules['forge_fibo2.contract'].validate_request(job, profile['variant'])
+                job.override_settings['sd_vae_decode_method'] = 'Full'
             output = processing.process_images(job)
             if shared.state.interrupted or shared.state.skipped or getattr(shared.state, 'stopping_generation', False):
                 return
@@ -198,8 +204,11 @@ class Script(scripts.Script):
                 p.extra_generation_params['Refiner prompts'] = 'explicit target prompts; base unchanged'
                 p.extra_generation_params['Refiner negative policy'] = 'explicit target negative; base/AutoNeg unchanged'
             for key, value in extra.items():
-                if key.startswith('Ideogram 4 refiner'):
+                if key.startswith(('Ideogram 4 refiner', 'FIBO ', 'MOSS ')):
                     p.extra_generation_params['Refiner ' + key] = value
+            if profile.get('family') == 'fibo2':
+                p.extra_generation_params.pop('Refiner denoising strength', None)
+                p.extra_generation_params['Refiner input mode'] = 'FIBO 2.0 reference edit; denoising strength unused'
             if extra.get('FLUX.3 reference mode', '').startswith('direct conditioning'):
                 p.extra_generation_params.pop('Refiner denoising strength', None)
                 p.extra_generation_params['Refiner input mode'] = 'FLUX.3 direct reference; denoising strength unused'
@@ -262,7 +271,8 @@ def _release_for_switch(checkpoint):
     for name, method in (('pi_qwen21.lib.runtime', 'release'),
                          ('pi_boogu_image.lib.pipeline', 'release'),
                          ('pi_sensenova.run', 'release'), ('pi_h3.runtime', 'release'),
-                         ('pi_hunyuan.runtime', 'release'), ('flux3_forge.runtime', 'unload')):
+                         ('pi_hunyuan.runtime', 'release'), ('flux3_forge.runtime', 'unload'),
+                         ('forge_fibo2.engine', 'release_current')):
         runtime = sys.modules.get(name)
         release = getattr(runtime, method, None)
         if callable(release):
@@ -388,7 +398,109 @@ def _target_profile(checkpoint, info):
         is_base=isinstance(asset,dict) and asset.get('model_family')=='base'
         return {'family':'flux3','preset':'flux3','modules':[],
                 'sampler':'Euler','scheduler':'Automatic','steps':25 if is_base else 16}
-    return {}
+    filename = getattr(info, 'filename', None)
+    if not filename:
+        return {}
+    fibo = sys.modules.get('forge_fibo2.contract')
+    runtime = sys.modules.get('forge_fibo2.runtime')
+    profile = {}
+    if fibo is not None and fibo.is_fibo2_checkpoint(filename):
+        if runtime is None:
+            # The owning extension loads its runtime lazily on first use.
+            import importlib
+            try:
+                runtime = importlib.import_module('forge_fibo2.runtime')
+            except ImportError as exc:
+                raise ValueError('FIBO 2.0 runtime is unavailable; check its extension dependencies.') from exc
+        metadata, _ = runtime._validate_metadata(filename, 'transformer')
+        variant = metadata.get('verified_official_variant', metadata.get('project_invisible.variant'))
+        if variant is None:
+            from forge_fibo2.provenance import identify
+            variant = identify(filename, 'transformer')['variant']
+        if variant not in ('dev', 'edit-turbo'):
+            raise ValueError('FIBO 2.0 checkpoint variant is unverified.')
+        profile = {'family':'fibo2', 'variant':variant,
+                   'preset':'fibo2_dev' if variant == 'dev' else 'fibo2',
+                   'sampler':'Euler', 'scheduler':'Simple',
+                   'steps':30 if variant == 'dev' else 4,
+                   'cfg':5.0 if variant == 'dev' else 1.0}
+    integration = sys.modules.get('model_autolink.integration')
+    resolver = getattr(integration, '_resolver', None)
+    presets = {'qwen_image21':'qwen21', 'flux2_klein4':'klein', 'flux2_klein9':'klein', 'moss_image':'moss'}
+    moss_assets = sys.modules.get('forge_moss.native.assets')
+    if not profile and moss_assets is not None and moss_assets.valid_checkpoint(filename):
+        profile = _native_profile('moss_image', 'moss')
+    if not profile:
+        # Native UI presets remember checkpoint aliases and matching components.
+        # This also works when optional Autolink is absent or disabled.
+        for family, preset in (('qwen_image21', 'qwen21'), ('flux2_klein4', 'klein'), ('moss_image', 'moss')):
+            saved = shared.opts.data.get('forge_checkpoint_' + preset)
+            if saved and sd_models.get_closet_checkpoint_match(saved) == info:
+                profile = _native_profile(family, preset)
+                break
+    if resolver is not None:
+        try:
+            _, match = resolver.checkpoint(filename)
+        except (RuntimeError, ValueError, OSError):
+            match = None
+        family = getattr(match, 'label', None)
+        if family in presets or profile:
+            # Resolve components without saving temporary target preferences.
+            modules, _, _ = resolver.resolve(filename, persist=False)
+            if not profile:
+                profile = _native_profile(family, presets[family])
+            profile['modules'] = list(modules)
+    if profile and 'modules' not in profile:
+        key = 'forge_additional_modules_' + profile['preset']
+        profile['modules'] = list(shared.opts.data.get(key) or [])
+        if not profile['modules'] and profile['family'] != 'fibo2':
+            raise ValueError('Select matching text encoder/VAE in the ' + profile['preset'] + ' UI Preset before refinement, or enable Model Autolink.')
+    return profile
+
+
+def _native_profile(family, preset):
+    profile = {'family':family, 'preset':preset,
+            'sampler':shared.opts.data.get(preset + '_i2i_sampler', 'Euler'),
+            'scheduler':shared.opts.data.get(preset + '_i2i_scheduler', {'qwen21':'Simple', 'moss':'MOSS'}.get(preset, 'Beta')),
+            'step':shared.opts.data.get(preset + '_i2i_step', {'qwen21':32, 'moss':50}.get(preset, 4))}
+    if family == 'moss_image':
+        profile['cfg'] = shared.opts.data.get('moss_i2i_cfg', 3.0)
+    return profile
+
+
+def _target_cfg(p, cfg):
+    profile = getattr(p, '_pi_target_profile', None) or {}
+    return cfg if cfg is not None and cfg >= 1 else profile.get('cfg', 1.0)
+
+
+def _validate_target_request(p, profile):
+    if profile.get('family') == 'moss_image':
+        import sys
+        patches = sys.modules.get('forge_moss.native.patches')
+        if not getattr(patches, '_applied', False):
+            raise ValueError('MOSS backend is unavailable. Enable its extension and restart Forge; check startup compatibility messages.')
+    if profile.get('family') != 'fibo2':
+        return
+    import sys
+    request = copy.copy(p)
+    request.init_images = [object()]
+    request.prompt, request.negative_prompt = _target_text(p)
+    request.cfg_scale = _target_cfg_for_profile(p, profile)
+    request.steps = getattr(p, '_pi_refiner_steps', 0) or profile['steps']
+    request.sampler_name, request.scheduler = profile['sampler'], profile['scheduler']
+    request.resize_mode = 0
+    request.enable_hr = False
+    request.refiner_checkpoint_info = None
+    if profile['variant'] == 'edit-turbo':
+        negatives = request.negative_prompt if isinstance(request.negative_prompt, list) else [request.negative_prompt]
+        if any(str(value or '').strip() for value in negatives):
+            raise ValueError('FIBO 2.0 Edit Turbo requires an empty target negative prompt. Use separate refiner prompts to preserve the base negative.')
+    sys.modules['forge_fibo2.contract'].validate_request(request, profile['variant'])
+
+
+def _target_cfg_for_profile(p, profile):
+    cfg = (getattr(p, '_pi_refiner', None) or (None, None, 0))[2]
+    return cfg if cfg is not None and cfg >= 1 else profile.get('cfg', 1.0)
 
 
 def _target_setting(p, suffix, fallback):
@@ -428,7 +540,7 @@ def _fast_steps(p, strength):
             raise ValueError('Refiner steps must be an integer from1 to100.')
         return int(explicit)
     profile = getattr(p, '_pi_target_profile', None) or {}
-    if profile.get('family') == 'flux3': return profile['steps']
+    if profile.get('family') in ('flux3', 'fibo2'): return profile['steps']
     base = max(1, int(_target_setting(p, 'step', p.steps)))
     return min(base, 8, max(2, math.ceil(base * strength)))
 
@@ -472,6 +584,7 @@ def _checkpoint_session(p, checkpoint):
     from modules_forge import main_entry
     target = _preflight(checkpoint, p)
     profile = _target_profile(checkpoint, target)
+    _validate_target_request(p, profile)
     old_profile = getattr(p, '_pi_target_profile', None)
     options = copy.deepcopy(shared.opts.data)
     original_info = sd_models.get_closet_checkpoint_match(options.get('sd_model_checkpoint'))
@@ -545,9 +658,45 @@ def _checkpoint_session(p, checkpoint):
 
 
 class _OptionsOnlyRunner:
-    """Expose saved model options without rerunning postprocessors in pass two."""
+    """Keep model lifecycle, without rerunning unrelated processing scripts."""
     def __init__(self, runner):
         self.alwayson_scripts = getattr(runner, 'alwayson_scripts', [])
+
+    def process(self, p, *args, **kwargs):
+        model = getattr(p, 'sd_model', None)
+        if getattr(model, 'is_fibo2', False):
+            model.bind(p)
+
+    def postprocess_image_after_composite(self, p, pp, *args, **kwargs):
+        if getattr(getattr(p, 'sd_model', None), 'is_fibo2', False):
+            prepared = getattr(p, '_fibo2_edit_context', None)
+            if prepared is not None:
+                from forge_fibo2.editing import restore_masked_alpha
+                pp.image = restore_masked_alpha(pp.image, prepared)
+
+    def _moss_hook(self, name, p, *args, **kwargs):
+        if not getattr(getattr(p, 'sd_model', None), 'is_moss_image', False):
+            return
+        import sys
+        owner = sys.modules.get('forge_moss.native.spectrum')
+        session = getattr(owner, 'Session', None)
+        if session is None:
+            return
+        for script in self.alwayson_scripts:
+            hook = getattr(script, name, None)
+            # Forge scripts need not be in sys.modules. Identify the hook by
+            # its actual owning Session class, not its displayed title.
+            if callable(hook) and getattr(hook, '__globals__', {}).get('Session') is session:
+                hook(p, *args, **kwargs)
+
+    def process_before_every_sampling(self, p, **kwargs):
+        self._moss_hook('process_before_every_sampling', p, **kwargs)
+
+    def postprocess_batch(self, p, *args, **kwargs):
+        self._moss_hook('postprocess_batch', p, *args, **kwargs)
+
+    def postprocess(self, p, processed, *args):
+        self._moss_hook('postprocess', p, processed, *args)
 
     def __getattr__(self, name):
         return lambda *args, **kwargs: None
