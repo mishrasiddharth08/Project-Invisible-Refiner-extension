@@ -14,12 +14,16 @@ _DLSS_TARGET = 'DLSS 5 Neural Rendering'
 
 
 def _dlss_backend():
+    return _refiner_helper('dlss5', 'pi_refiner_dlss5_backend')
+
+
+def _refiner_helper(helper, name=None):
     import importlib.util
     import sys
     from pathlib import Path
-    name = 'pi_refiner_dlss5_backend'
+    name = name or 'pi_refiner_' + helper
     if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / 'lib' / 'dlss5.py')
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / 'lib' / (helper + '.py'))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         sys.modules[name] = module
@@ -150,13 +154,21 @@ class Script(scripts.Script):
             log.info('Refining image %s with %s (strength %.3f)', pp.index + 1, checkpoint, strength)
             print(f'[PI-Refiner] Refining image {pp.index + 1}: {checkpoint}')
             i = pp.index
+            profile = getattr(p, '_pi_target_profile', None) or {}
+            positive, negative = _target_text(p, i)
+            omit_negative = profile.get('family') in ('flux3', 'ideogram4') and getattr(p, '_pi_refiner_text', None) is None
+            target_cfg = _target_cfg(p, cfg)
+            guidance = None
+            if profile.get('family') == 'ideogram4':
+                positive, guidance = _refiner_helper('ideogram_refiner').guidance_prompt(
+                    profile['checkpoint'], positive, target_cfg, shared.opts.data.get('pi_i4_uncond_mode', 'Auto'))
             job = processing.StableDiffusionProcessingImg2Img(
                 init_images=[pp.image], resize_mode=0, width=pp.image.width, height=pp.image.height,
-                prompt=_prompt(_target_text(p, i)[0]),
-                negative_prompt=_target_text(p, i)[1],
+                prompt=_prompt(positive),
+                negative_prompt='' if omit_negative else negative,
                 seed=_value(p, 'all_seeds', i, p.seed), subseed=_value(p, 'all_subseeds', i, p.subseed),
                 subseed_strength=p.subseed_strength, steps=_fast_steps(p, strength), denoising_strength=strength,
-                cfg_scale=_target_cfg(p, cfg),
+                cfg_scale=target_cfg,
                 image_cfg_scale=getattr(p, 'image_cfg_scale', None),
                 distilled_cfg_scale=_target_setting(p, 'dcfg', p.distilled_cfg_scale),
                 sampler_name=_target_setting(p, 'sampler', p.sampler_name),
@@ -177,13 +189,15 @@ class Script(scripts.Script):
             job.scripts = _OptionsOnlyRunner(getattr(p, 'scripts', None))
             job.script_args = getattr(p, 'script_args', ())
             job.disable_extra_networks = getattr(p, 'disable_extra_networks', False)
-            profile = getattr(p, '_pi_target_profile', None) or {}
             if profile.get('family') == 'fibo2':
                 # Let the owning engine validate its exact recipe; no host edits.
                 import sys
                 sys.modules['forge_fibo2.contract'].validate_request(job, profile['variant'])
                 job.override_settings['sd_vae_decode_method'] = 'Full'
-            output = processing.process_images(job)
+            if profile.get('family') == 'moss_image':
+                _refiner_helper('moss_refiner').configure_job(job, profile)
+            generate = profile.get('generate')
+            output = generate(job) if generate is not None else processing.process_images(job)
             if shared.state.interrupted or shared.state.skipped or getattr(shared.state, 'stopping_generation', False):
                 return
             first = getattr(output, 'index_of_first_image', 0)
@@ -192,24 +206,30 @@ class Script(scripts.Script):
                 raise RuntimeError(generation_error)
             if first >= len(output.images):
                 raise RuntimeError(getattr(output, 'info', None) or 'Refiner returned no sample')
+            extra = getattr(output, 'extra_generation_params', None) or {}
+            if profile.get('family') == 'ideogram4' and 'Ideogram 4 refiner steps' not in extra:
+                raise RuntimeError('The Ideogram 4 engine did not confirm refinement. The base image was retained.')
             pp.image = output.images[first]
             p.extra_generation_params.pop('Refiner error', None)
-            extra = getattr(output, 'extra_generation_params', None) or {}
             actual_steps = extra.get('FLUX.3 steps', extra.get('Ideogram 4 refiner steps', job.steps))
             p.extra_generation_params.update({'Refiner': checkpoint,
                 'Refiner switch at': switch, 'Refiner denoising strength': strength,
                 'Refiner CFG scale': job.cfg_scale, 'Refiner steps': actual_steps})
             p.extra_generation_params['Refiner sampler'] = getattr(job,'sampler_name',_target_setting(p,'sampler',p.sampler_name))
+            if guidance:
+                p.extra_generation_params['Refiner Ideogram 4 guidance path'] = guidance
             if getattr(p, '_pi_refiner_text', None) is not None:
                 p.extra_generation_params['Refiner prompts'] = 'explicit target prompts; base unchanged'
                 p.extra_generation_params['Refiner negative policy'] = 'explicit target negative; base/AutoNeg unchanged'
+            elif omit_negative and str(negative or '').strip():
+                p.extra_generation_params['Refiner negative policy'] = 'unsupported by target; base negative preserved'
             for key, value in extra.items():
                 if key.startswith(('Ideogram 4 refiner', 'FIBO ', 'MOSS ')):
                     p.extra_generation_params['Refiner ' + key] = value
             if profile.get('family') == 'fibo2':
                 p.extra_generation_params.pop('Refiner denoising strength', None)
                 p.extra_generation_params['Refiner input mode'] = 'FIBO 2.0 reference edit; denoising strength unused'
-            if extra.get('FLUX.3 reference mode', '').startswith('direct conditioning'):
+            if profile.get('family') == 'flux3' or extra.get('FLUX.3 reference mode', '').startswith('direct conditioning'):
                 p.extra_generation_params.pop('Refiner denoising strength', None)
                 p.extra_generation_params['Refiner input mode'] = 'FLUX.3 direct reference; denoising strength unused'
         except Exception as exc:
@@ -272,6 +292,7 @@ def _release_for_switch(checkpoint):
                          ('pi_boogu_image.lib.pipeline', 'release'),
                          ('pi_sensenova.run', 'release'), ('pi_h3.runtime', 'release'),
                          ('pi_hunyuan.runtime', 'release'), ('flux3_forge.runtime', 'unload'),
+                         ('flux3_forge.comfy_bridge', 'unload'),
                          ('forge_fibo2.engine', 'release_current')):
         runtime = sys.modules.get(name)
         release = getattr(runtime, method, None)
@@ -304,6 +325,8 @@ def _report_refiner_error(p, result, error):
     """Expose retained-base failure in result metadata and the running UI."""
     import sys
     message = str(error)
+    if len(message) > 900:
+        message = message.splitlines()[0][:800] + ' (details in the Forge console)'
     p.extra_generation_params['Refiner error'] = message
     extra = getattr(result,'extra_generation_params',None)
     if isinstance(extra,dict): extra['Refiner error'] = message
@@ -312,6 +335,12 @@ def _report_refiner_error(p, result, error):
     if callable(notice):
         try: notice('Refiner failed; base images retained: '+message)
         except Exception: log.warning('Could not display the Refiner warning; failure remains in metadata.')
+
+
+def _is_ideogram(info):
+    import sys
+    selection = sys.modules.get('pi_ideogram_forge.selection')
+    return bool(selection is not None and selection._ci_is_ideogram4(info))
 
 
 def _preflight(checkpoint, p=None):
@@ -326,28 +355,36 @@ def _preflight(checkpoint, p=None):
         asset = boogu.selected(name=checkpoint)
         if asset is not None and 'edit' not in asset.trunk:
             raise ValueError('Boogu Base/Turbo cannot refine images. Select Boogu Edit or Edit-Turbo.')
-    ideogram = sys.modules.get('pi_ideogram_forge.selection')
-    routing = sys.modules.get('pi_ideogram_forge.routing')
-    if ideogram is not None and routing is not None and ideogram._ci_is_ideogram4(info):
+    if _is_ideogram(info):
+        routing = sys.modules.get('pi_ideogram_forge.routing')
+        if routing is None:
+            raise ValueError('Ideogram 4 routing is unavailable; enable its extension and restart Forge.')
         routing._enforce_loadable_policy(info.filename)
-        if p is not None and getattr(p, 'image_mask', None) is not None:
-            raise ValueError('Ideogram 4 experimental refinement does not support masks.')
-    flux = sys.modules.get('flux3_forge.bridge')
-    if flux is not None and flux.selected(name=checkpoint):
+        if p is not None:
+            if any(getattr(p, name, None) is not None for name in
+                   ('image_mask', 'mask', 'mask_for_overlay', 'latent_mask')):
+                raise ValueError('Ideogram 4 experimental refinement does not support masks.')
+            explicit = getattr(p, '_pi_refiner_text', None)
+            negatives = (explicit[1] if explicit is not None else '')
+            negatives = negatives if isinstance(negatives, list) else [negatives]
+            if any(str(value or '').strip() for value in negatives):
+                raise ValueError('Ideogram 4 refiner requires an empty target negative prompt. Use separate refiner prompts to keep the base negative unchanged.')
+            if getattr(p, 'subseed_strength', 0):
+                raise ValueError('Ideogram 4 refiner does not support variation seed strength; use 0.')
+    flux, asset = _flux3_target(checkpoint, info)
+    if asset is not None:
         for setting, label in (('flux3_caption_acknowledged', 'full-caption'),
                                ('flux3_reference_acknowledged', 'reference-image')):
             if not flux._setting(setting, False):
                 raise ValueError('Enable the FLUX.3 ' + label + ' acknowledgement in Settings before refinement.')
         if p is not None:
             positive, negative = _target_text(p)
-            values = negative if isinstance(negative, list) else [negative]
-            if any(str(value or '').strip() for value in values):
-                raise ValueError('FLUX.3 refiner cannot use negative prompts; clear them or explicitly use separate refiner prompts with an empty target negative.')
+            if getattr(p, '_pi_refiner_text', None) is not None and str(negative or '').strip():
+                raise ValueError('FLUX.3 refiner cannot use negative prompts; clear the target negative prompt.')
             import math
             cfg = (getattr(p, '_pi_refiner', None) or (None,None,0))[2]
             if cfg is not None and not math.isfinite(float(cfg)):
                 raise ValueError('Refiner CFG must be finite.')
-            asset=flux.selected(name=checkpoint) or {}
             asset=asset if isinstance(asset,dict) else {}
             if asset.get('model_family')=='base':
                 if cfg is not None and not 0 <= float(cfg) <= 20:
@@ -356,7 +393,7 @@ def _preflight(checkpoint, p=None):
                 raise ValueError('FLUX.3 refiner requires Refiner CFG1; use0 or1, not the base model CFG.')
             if getattr(p, 'subseed_strength', 0):
                 raise ValueError('FLUX.3 refiner does not support variation seed strength; use0 for this pairing.')
-            if getattr(p, 'image_mask', None) is not None:
+            if getattr(p, 'image_mask', None) is not None or getattr(p, 'mask', None) is not None:
                 raise ValueError('FLUX.3 refiner supports full-frame references, not masked/inpainting refinement.')
             steps = getattr(p, '_pi_refiner_steps', 0)
             if not isinstance(steps,(int,float)) or not 0 <= steps <= 100 or int(steps)!=steps:
@@ -390,13 +427,37 @@ def _target_text(p, index=None):
             _value(p,'all_negative_prompts',index,p.negative_prompt))
 
 
+def _flux3_target(checkpoint, info):
+    import sys
+    from pathlib import Path
+    bridge = sys.modules.get('flux3_forge.bridge')
+    if bridge is not None:
+        for name in dict.fromkeys((checkpoint, getattr(info, 'title', None), getattr(info, 'short_title', None))):
+            if name and (asset := bridge.selected(name=name)):
+                if not callable(getattr(bridge, 'generate', None)):
+                    raise ValueError('FLUX.3 generation bridge is unavailable; update its extension and restart Forge.')
+                return bridge, asset
+    path = Path(getattr(info, 'filename', None) or str(checkpoint))
+    if (path.stem.casefold().startswith('flux3-image-klein-')
+            or str(checkpoint).casefold().startswith('flux 3 image klein')):
+        raise ValueError('Select a FLUX.3 checkpoint registered by its extension. For Comfy weights, enable the matching verified FLUX.3 profile and refresh checkpoints.')
+    return None, None
+
+
 def _target_profile(checkpoint, info):
     import sys
-    flux = sys.modules.get('flux3_forge.bridge')
-    if flux is not None and flux.selected(name=checkpoint):
-        asset=flux.selected(name=checkpoint)
+    if _is_ideogram(info):
+        return {'family':'ideogram4', 'external':True, 'preset':'ideogram4', 'checkpoint':info.filename,
+                'modules':_refiner_helper('ideogram_refiner').resolve_modules(info.filename),
+                'sampler':shared.opts.data.get('ideogram4_i2i_sampler', 'Euler'),
+                'scheduler':shared.opts.data.get('ideogram4_i2i_scheduler', 'Simple'),
+                'step':shared.opts.data.get('ideogram4_i2i_step', 20),
+                'cfg':shared.opts.data.get('ideogram4_i2i_cfg', 7.0)}
+    flux, asset = _flux3_target(checkpoint, info)
+    if asset is not None:
         is_base=isinstance(asset,dict) and asset.get('model_family')=='base'
-        return {'family':'flux3','preset':'flux3','modules':[],
+        return {'family':'flux3','preset':'flux3','modules':[], 'external':True,
+                'generate': lambda job: flux.generate(job, asset),
                 'sampler':'Euler','scheduler':'Automatic','steps':25 if is_base else 16}
     filename = getattr(info, 'filename', None)
     if not filename:
@@ -427,8 +488,7 @@ def _target_profile(checkpoint, info):
     integration = sys.modules.get('model_autolink.integration')
     resolver = getattr(integration, '_resolver', None)
     presets = {'qwen_image21':'qwen21', 'flux2_klein4':'klein', 'flux2_klein9':'klein', 'moss_image':'moss'}
-    moss_assets = sys.modules.get('forge_moss.native.assets')
-    if not profile and moss_assets is not None and moss_assets.valid_checkpoint(filename):
+    if not profile and _refiner_helper('moss_refiner').identify(filename):
         profile = _native_profile('moss_image', 'moss')
     if not profile:
         # Native UI presets remember checkpoint aliases and matching components.
@@ -444,7 +504,7 @@ def _target_profile(checkpoint, info):
         except (RuntimeError, ValueError, OSError):
             match = None
         family = getattr(match, 'label', None)
-        if family in presets or profile:
+        if (not profile and family in presets) or (profile and family == profile['family']):
             # Resolve components without saving temporary target preferences.
             modules, _, _ = resolver.resolve(filename, persist=False)
             if not profile:
@@ -455,6 +515,8 @@ def _target_profile(checkpoint, info):
         profile['modules'] = list(shared.opts.data.get(key) or [])
         if not profile['modules'] and profile['family'] != 'fibo2':
             raise ValueError('Select matching text encoder/VAE in the ' + profile['preset'] + ' UI Preset before refinement, or enable Model Autolink.')
+    if profile.get('family') == 'moss_image':
+        profile = _refiner_helper('moss_refiner').normalize_profile(profile)
     return profile
 
 
@@ -475,10 +537,7 @@ def _target_cfg(p, cfg):
 
 def _validate_target_request(p, profile):
     if profile.get('family') == 'moss_image':
-        import sys
-        patches = sys.modules.get('forge_moss.native.patches')
-        if not getattr(patches, '_applied', False):
-            raise ValueError('MOSS backend is unavailable. Enable its extension and restart Forge; check startup compatibility messages.')
+        _refiner_helper('moss_refiner').validate(profile)
     if profile.get('family') != 'fibo2':
         return
     import sys
@@ -561,6 +620,16 @@ def _release_base_conditioning(p):
         shared.state.current_latent = None
 
 
+def _bind_ideogram_checkpoint(target, modules):
+    # Ideogram's existing takeover selects from Forge's loading record, not
+    # only the dropdown option. Update the record without loading native weights.
+    model_data = getattr(sd_models, 'model_data', None)
+    if model_data is None or not isinstance(model_data.forge_loading_parameters, dict):
+        raise ValueError('Ideogram 4 checkpoint selection is unavailable on this Forge build.')
+    model_data.forge_loading_parameters = dict(model_data.forge_loading_parameters,
+        checkpoint_info=target, additional_modules=list(modules), unet_storage_dtype=None)
+
+
 @contextmanager
 def _checkpoint_session(p, checkpoint):
     """One target switch per batch, exact option rollback, no eager base load."""
@@ -588,8 +657,12 @@ def _checkpoint_session(p, checkpoint):
     old_profile = getattr(p, '_pi_target_profile', None)
     options = copy.deepcopy(shared.opts.data)
     original_info = sd_models.get_closet_checkpoint_match(options.get('sd_model_checkpoint'))
-    switched = original_info != target
     model_data = getattr(sd_models, 'model_data', None)
+    selected = getattr(model_data, 'forge_loading_parameters', None) or {}
+    switched = original_info != target or (profile.get('family') in ('moss_image', 'ideogram4') and (
+        options.get('forge_preset') != profile['preset']
+        or list(options.get('forge_additional_modules') or []) != profile['modules']
+        or (profile['family'] == 'ideogram4' and selected.get('checkpoint_info') != target)))
     loading = copy.copy(getattr(model_data, 'forge_loading_parameters', None))
     if isinstance(loading, dict) and isinstance(loading.get('additional_modules'), list):
         loading['additional_modules'] = list(loading['additional_modules'])
@@ -606,7 +679,12 @@ def _checkpoint_session(p, checkpoint):
                 # Packed target weights must not inherit the source model's
                 # forced FP8/FP16 storage conversion setting.
                 shared.opts.data['forge_unet_storage_dtype'] = 'Automatic'
-                main_entry.checkpoint_change(checkpoint, preset=None, save=False, refresh=False)
+                if profile:
+                    # The target profile is already resolved. Running the
+                    # UI's checkpoint callback would persist Autolink state.
+                    shared.opts.data['sd_model_checkpoint'] = getattr(target, 'title', None) or checkpoint
+                else:
+                    main_entry.checkpoint_change(checkpoint, preset=None, save=False, refresh=False)
                 if profile:
                     shared.opts.data['forge_preset'] = profile['preset']
                     shared.opts.data['forge_additional_modules'] = list(profile['modules'])
@@ -614,7 +692,10 @@ def _checkpoint_session(p, checkpoint):
                 if target_preset != options.get('forge_preset'):
                     shared.opts.data['forge_unet_storage_dtype'] = shared.opts.data.get(
                         f'forge_unet_storage_dtype_{target_preset}', 'Automatic')
-                _refresh_for_refiner(main_entry)
+                if not profile.get('external'):
+                    _refresh_for_refiner(main_entry)
+                elif profile.get('family') == 'ideogram4':
+                    _bind_ideogram_checkpoint(target, profile['modules'])
             finally:
                 # Autolink can also change per-family module and preset keys.
                 restore_keys = {key for key in options.keys() | shared.opts.data.keys()
@@ -649,7 +730,7 @@ def _checkpoint_session(p, checkpoint):
                     # Restore without calling Autolink's persistence/refresh
                     # hook. The next normal job loads the base on demand.
                     processing.need_global_unload = True
-                    if not getattr(p, '_pi_external_finish', False):
+                    if not getattr(p, '_pi_external_finish', False) and not profile.get('external'):
                         sd_models.forge_model_reload()
         finally:
             p._pi_active_checkpoint = None
@@ -844,9 +925,15 @@ def _finish_images(p, result):
         grid_info_original = result.infotexts[0]
     deferred = getattr(p, '_pi_deferred_slots', None)
     if deferred:
-        identities = {id(pp.image): pp.index for pp in deferred}
-        slots = [(index, identities[id(image)]) for index, image in enumerate(samples)
-                 if index >= first and id(image) in identities]
+        from collections import defaultdict, deque
+        identities = defaultdict(deque)
+        for pp in deferred:
+            identities[id(pp.image)].append(pp.index)
+        slots = []
+        for index, image in enumerate(samples):
+            indices = identities.get(id(image))
+            if index >= first and indices:
+                slots.append((index, indices.popleft()))
         compact = list(getattr(result, 'infotexts', None) or [])
         if compact and len(compact) != len(samples):
             sample_at = dict(slots)
@@ -913,24 +1000,30 @@ def _finish_images(p, result):
         if changed and (first == 1 or grid_records):
             from modules import images
             grid = images.image_grid([samples[index] for index, _ in slots], getattr(p, 'batch_size', 1))
-            if first == 1:
-                grid_records.append((id(samples[0]), grid_info_original))
-                samples[0] = grid
             details = ', '.join(f'{k}: {v}' for k, v in p.extra_generation_params.items() if k.startswith('Refiner') and k != 'Refiner error')
             grid_info = (grid_info_original or '') + ', ' + details
             grid.info['parameters'] = grid_info
-            if first:
+            if first == 1:
+                grid_records.append((id(samples[0]), grid_info_original))
+            seen_grids = set()
+            grid_failed = False
+            try:
+                for record in grid_records:
+                    identity, original_info = record if isinstance(record, tuple) else (record, grid_info_original)
+                    if identity in seen_grids:
+                        continue
+                    seen_grids.add(identity)
+                    saved_info = (original_info if original_info is not None else grid_info_original) or ''
+                    _rewrite_saved(grid, saved_info + ', ' + details, getattr(p, '_pi_saved_files', {}).get(identity, []))
+            except Exception as exc:
+                grid_failed = True
+                failures.append(f'Grid: saving refined grid failed: {exc}')
+                log.exception('Could not replace saved base grid; gallery grid retained')
+            if first == 1 and not grid_failed:
+                samples[0] = grid
                 result.info = grid_info
                 if getattr(result, 'infotexts', None):
                     result.infotexts[0] = grid_info
-            seen_grids = set()
-            for record in grid_records:
-                identity, original_info = record if isinstance(record, tuple) else (record, grid_info_original)
-                if identity in seen_grids:
-                    continue
-                seen_grids.add(identity)
-                saved_info = (original_info if original_info is not None else grid_info_original) or ''
-                _rewrite_saved(grid, saved_info + ', ' + details, getattr(p, '_pi_saved_files', {}).get(identity, []))
         if failures:
             p.extra_generation_params['Refiner error'] = '; '.join(failures)
         if hasattr(result, 'extra_generation_params'):
@@ -947,6 +1040,45 @@ def _finish_images(p, result):
                 delattr(p, key)
 
 
+@contextmanager
+def _ideogram_base_override(p):
+    previous = shared.opts.data.get('sd_model_checkpoint')
+    override = (getattr(p, 'override_settings', None) or {}).get('sd_model_checkpoint') or previous
+    target = sd_models.get_closet_checkpoint_match(override) if override else None
+    if target is None or not _is_ideogram(target):
+        yield
+        return
+    import sys
+    routing = sys.modules.get('pi_ideogram_forge.routing')
+    if routing is None:
+        raise ValueError('Ideogram 4 routing is unavailable; enable its extension and restart Forge.')
+    routing._enforce_loadable_policy(target.filename)
+    model_data = sd_models.model_data
+    loading = model_data.forge_loading_parameters
+    preferred = shared.opts.data.get('forge_additional_modules') or () if loading.get('checkpoint_info') == target else ()
+    modules = _refiner_helper('ideogram_refiner').resolve_modules(target.filename, preferred=preferred)
+    missing = object()
+    keys = ('sd_model_checkpoint', 'forge_preset', 'forge_additional_modules')
+    saved = {key: shared.opts.data.get(key, missing) for key in keys}
+    _release_for_switch(override)
+    try:
+        shared.opts.data['sd_model_checkpoint'] = getattr(target, 'title', None) or override
+        shared.opts.data['forge_preset'] = 'ideogram4'
+        shared.opts.data['forge_additional_modules'] = list(modules)
+        _bind_ideogram_checkpoint(target, modules)
+        yield
+    finally:
+        try:
+            _release_for_switch(previous)
+        finally:
+            for key, value in saved.items():
+                if value is missing:
+                    shared.opts.data.pop(key, None)
+                else:
+                    shared.opts.data[key] = value
+            model_data.forge_loading_parameters = loading
+
+
 def _dispatch(original, p, args, kwargs, runner=None):
     if getattr(p, '_pi_refining', False) or getattr(p, '_pi_dispatching', False):
         return original(*args, **kwargs)
@@ -959,7 +1091,9 @@ def _dispatch(original, p, args, kwargs, runner=None):
     p._pi_deferred_slots = []
     p._pi_saved_grids = []
     try:
-        return _finish(p, original(*args, **kwargs))
+        with _ideogram_base_override(p):
+            result = original(*args, **kwargs)
+        return _finish(p, result)
     finally:
         p._pi_dispatching = False
         p._pi_saved_files = None
