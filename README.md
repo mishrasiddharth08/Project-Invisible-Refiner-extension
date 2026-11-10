@@ -16,7 +16,7 @@ The extension replaces the native mid-sampling latent switch with a separate ima
 Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, are forwarded. The LoRA rules textbox and explanatory panel are removed; prompt LoRAs are left unchanged. Use LoRAs compatible with the receiving model.
 
 ## Testing status
-124 automated tests passed. On an RTX 5090, fixed-seed 512×512 generations
+10 Nov 2026: 124 automated tests passed. On an RTX 5090, fixed-seed 512×512 generations
 verified MOSS Image SFT INT8 ConvRot as base and as its own Refiner, and
 MOSS into Ideogram 4 INT8 ConvRot and FLUX.3 Image Klein FP8. The three
 refined results changed pixels, matched their saved PNGs and restored settings.
