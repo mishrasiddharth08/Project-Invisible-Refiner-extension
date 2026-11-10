@@ -16,13 +16,15 @@ The extension replaces the native mid-sampling latent switch with a separate ima
 Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, are forwarded. The LoRA rules textbox and explanatory panel are removed; prompt LoRAs are left unchanged. Use LoRAs compatible with the receiving model.
 
 ## Testing status
-10 Nov 2026: 124 automated tests passed. On an RTX 5090, fixed-seed 512×512 generations
+10 Nov 2026: 125 automated tests passed. On an RTX 5090, fixed-seed 512×512 generations
 verified MOSS Image SFT INT8 ConvRot as base and as its own Refiner, and
 MOSS into Ideogram 4 INT8 ConvRot and FLUX.3 Image Klein FP8. The three
 refined results changed pixels, matched their saved PNGs and restored settings.
 Ideogram 4 and FLUX.3 also passed as bases feeding MOSS. These checks cover
 those model variants and routes, with four steps per pass; other variants,
 performance and image-quality comparisons were not tested.
+Additional RTX 5090 checks verified direct generation and refinement with FLUX.3 Klein Base and Distilled INT8 ConvRot, Distilled BF16, MOSS Base INT8 ConvRot, and FIBO 2.0 Dev INT8 ConvRot. The FIBO 2.0 Dev checks used 30 steps and CFG 5.
+
 It also recorded a live RTX 5090/Qwen 2.1 INT8 ConvRot generation with changed
 pixels and matching saved/gallery output, an Extras upload/save check preserving
 size, alpha and generation parameters, and five distinct existing-image outputs

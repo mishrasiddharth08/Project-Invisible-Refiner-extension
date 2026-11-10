@@ -156,6 +156,7 @@ class Script(scripts.Script):
             i = pp.index
             profile = getattr(p, '_pi_target_profile', None) or {}
             positive, negative = _target_text(p, i)
+            positive, omitted_tags = _target_positive(p, positive, profile)
             omit_negative = profile.get('family') in ('flux3', 'ideogram4') and getattr(p, '_pi_refiner_text', None) is None
             target_cfg = _target_cfg(p, cfg)
             guidance = None
@@ -223,6 +224,8 @@ class Script(scripts.Script):
                 p.extra_generation_params['Refiner negative policy'] = 'explicit target negative; base/AutoNeg unchanged'
             elif omit_negative and str(negative or '').strip():
                 p.extra_generation_params['Refiner negative policy'] = 'unsupported by target; base negative preserved'
+            if omitted_tags:
+                p.extra_generation_params['Refiner adapter policy'] = 'target does not support adapters; base tags preserved'
             for key, value in extra.items():
                 if key.startswith(('Ideogram 4 refiner', 'FIBO ', 'MOSS ')):
                     p.extra_generation_params['Refiner ' + key] = value
@@ -401,7 +404,7 @@ def _preflight(checkpoint, p=None):
             # Resolve names first, then reject declared foreign adapters without
             # loading any tensor payload or removing the user's tags.
             resolve = getattr(flux, '_resolve_adapters', None)
-            if callable(resolve):
+            if callable(resolve) and not (asset.get('comfy_profile') is not None and getattr(p, '_pi_refiner_text', None) is None):
                 from safetensors import safe_open
                 for prompt in positive if isinstance(positive,list) else [positive]:
                     _, adapters = resolve(str(prompt or ''))
@@ -427,11 +430,26 @@ def _target_text(p, index=None):
             _value(p,'all_negative_prompts',index,p.negative_prompt))
 
 
+def _target_positive(p, positive, profile):
+    if profile.get('comfy_profile') and getattr(p, '_pi_refiner_text', None) is None:
+        from modules import extra_networks
+        clean, tags = extra_networks.parse_prompt(positive)
+        return clean, bool(tags)
+    return positive, False
+
+
 def _flux3_target(checkpoint, info):
     import sys
     from pathlib import Path
     bridge = sys.modules.get('flux3_forge.bridge')
     if bridge is not None:
+        selected_refiner = getattr(bridge, 'selected_refiner', None)
+        if callable(selected_refiner):
+            asset = selected_refiner(name=checkpoint, filename=getattr(info, 'filename', None))
+            if asset is not None:
+                if not callable(getattr(bridge, 'generate', None)):
+                    raise ValueError('FLUX.3 generation bridge is unavailable; update its extension and restart Forge.')
+                return bridge, asset
         for name in dict.fromkeys((checkpoint, getattr(info, 'title', None), getattr(info, 'short_title', None))):
             if name and (asset := bridge.selected(name=name)):
                 if not callable(getattr(bridge, 'generate', None)):
@@ -457,6 +475,7 @@ def _target_profile(checkpoint, info):
     if asset is not None:
         is_base=isinstance(asset,dict) and asset.get('model_family')=='base'
         return {'family':'flux3','preset':'flux3','modules':[], 'external':True,
+                'comfy_profile':isinstance(asset,dict) and asset.get('comfy_profile') is not None,
                 'generate': lambda job: flux.generate(job, asset),
                 'sampler':'Euler','scheduler':'Automatic','steps':25 if is_base else 16}
     filename = getattr(info, 'filename', None)
@@ -504,7 +523,10 @@ def _target_profile(checkpoint, info):
         except (RuntimeError, ValueError, OSError):
             match = None
         family = getattr(match, 'label', None)
-        if (not profile and family in presets) or (profile and family == profile['family']):
+        expected_families = {profile.get('family')}
+        if profile.get('family') == 'fibo2' and profile.get('variant') == 'dev':
+            expected_families.add('fibo2_dev')
+        if (not profile and family in presets) or (profile and family in expected_families):
             # Resolve components without saving temporary target preferences.
             modules, _, _ = resolver.resolve(filename, persist=False)
             if not profile:

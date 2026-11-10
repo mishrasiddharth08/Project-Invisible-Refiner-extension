@@ -30,6 +30,20 @@ class Flux3Profiles(unittest.TestCase):
   self.assertEqual(self.modules.processing.StableDiffusionProcessingImg2Img.call_args.kwargs['negative_prompt'],'')
   self.assertEqual(self.p.all_negative_prompts,['base negative'])
   self.assertIn('base negative preserved',self.p.extra_generation_params['Refiner negative policy'])
+ def test_verified_raw_comfy_target_omits_only_inherited_tags(self):
+  raw=types.SimpleNamespace(filename='flux3-image-klein-base-int8-convrot.safetensors')
+  self.modules.sd_models.get_closet_checkpoint_match.return_value=raw
+  asset={'model_family':'base','comfy_profile':object()}
+  resolver=Mock(return_value=asset)
+  unsupported=Mock(side_effect=AssertionError('Base-only tags must not be resolved for the Comfy target'))
+  self.flux(selected=lambda **kwargs:None,selected_refiner=resolver,_resolve_adapters=unsupported)
+  self.p.prompt='base <lora:moss:1>'
+  networks=types.SimpleNamespace(parse_prompt=lambda prompt:('base',{'lora':['moss']}))
+  with patch.object(self.modules,'extra_networks',networks,create=True):self.run_pass()
+  self.assertTrue(resolver.called)
+  self.assertEqual(self.modules.processing.StableDiffusionProcessingImg2Img.call_args.kwargs['prompt'],'base')
+  self.assertEqual(self.p.prompt,'base <lora:moss:1>')
+  self.assertIn('base tags preserved',self.p.extra_generation_params['Refiner adapter policy'])
  def test_separate_target_prompt_does_not_mutate_base_or_inherit_negative(self):
   self.flux();self.p.prompt='base <lora:foreign:1>';self.p.negative_prompt='base negative';self.p.all_negative_prompts=['base negative']
   self.engine._setup(None,self.p,True,'target',.75,0,'',True,'A complete target caption','',16)
