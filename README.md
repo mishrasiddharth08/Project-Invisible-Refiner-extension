@@ -16,7 +16,13 @@ The extension replaces the native mid-sampling latent switch with a separate ima
 Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, are forwarded. The LoRA rules textbox and explanatory panel are removed; prompt LoRAs are left unchanged. Use LoRAs compatible with the receiving model.
 
 ## Testing status
-For this publication, all 100 CPU regression tests passed, including existing DLSS coverage and the new model routing/lifecycle checks. These tests do not establish real-weight GPU compatibility.
+124 automated tests passed. On an RTX 5090, fixed-seed 512×512 generations
+verified MOSS Image SFT INT8 ConvRot as base and as its own Refiner, and
+MOSS into Ideogram 4 INT8 ConvRot and FLUX.3 Image Klein FP8. The three
+refined results changed pixels, matched their saved PNGs and restored settings.
+Ideogram 4 and FLUX.3 also passed as bases feeding MOSS. These checks cover
+those model variants and routes, with four steps per pass; other variants,
+performance and image-quality comparisons were not tested.
 It also recorded a live RTX 5090/Qwen 2.1 INT8 ConvRot generation with changed
 pixels and matching saved/gallery output, an Extras upload/save check preserving
 size, alpha and generation parameters, and five distinct existing-image outputs
@@ -138,23 +144,18 @@ FIBO's required model binding and masked-alpha restoration remain active in the
 second pass; unrelated base processing scripts are not rerun. Its runtime can
 load on the first refiner request after starting Forge with another checkpoint.
 
-**MOSS-Image:** uses native img2img with its matching Qwen3.5 encoder and FLUX.2
-VAE, Euler/MOSS scheduler, saved target sampling preferences, and CFG 3 by default.
+**MOSS-Image:** uses Forge's built-in img2img with its matching Qwen3.5 encoder and
+FLUX.2 VAE, saved target sampling preferences, and CFG 3 by default. A removed
+saved scheduler falls back to Forge's current Simple scheduler.
 Select a MOSS checkpoint in the same Refiner dropdown. Switch at controls actual
 img2img denoising; the normal bounded refinement budget applies. Its native backend
-must be enabled at startup. Missing backend/components fail before unloading the base.
-The selected MOSS Spectrum setting is preserved with its own sampling and cleanup
-hooks. Default short passes do not qualify for forecasting; eligible Balanced runs
-need at least 17 target steps and Euler/MOSS. Actual MOSS timing/call/cache metadata
-is included; no extra acceleration is silently enabled.
+must be available at startup. Missing or incompatible components fail before
+unloading the base. The second pass disables MOSS reference mode so it uses
+the base pixels as an ordinary img2img input. Spectrum hooks run only when
+the owning Spectrum integration is installed.
 
-Validation: all 100 repository CPU tests passed (87 refiner routing/lifecycle tests plus DLSS coverage). Full-weight cross-model images,
-quality, speed, VRAM use and every quantization combination remain unverified.
-Only formats supported by the selected model's installed loader can work.
-
-Install the corresponding model extension first: this repository adds the refiner
-connection, not the FIBO, FLUX3 or MOSS backend itself. MOSS requires the
-Project Invisible MOSS-Image Forge Neo extension. Restart Forge after updating.
+Install the corresponding model extension for Ideogram 4, FLUX.3 or FIBO.
+MOSS uses the native engine in current Forge Neo. Restart Forge after updating.
 
 ## Special Thanks
 
@@ -172,14 +173,22 @@ Thanks also to the Forge Neo, Diffusers, Qwen, DeGrid, Spectrum and wider open-s
 If you contribute, test, or report issues and would like to be named here, say so and you will be added.
 
 
-## FLUX3 target prompt separation (GPU validation pending)
+## Ideogram 4 and FLUX.3 target prompts
 
-FLUX3 has no negative-prompt guidance. AutoNeg may remain enabled for the base:
-under Refiner target settings explicitly enable separate refiner prompts, supply
-a complete target caption without foreign base LoRA tags, and leave its negative
-prompt empty. The base prompt/AutoNeg output is retained. The second pass does not
-rerun processing scripts. Inherited unsupported negatives still fail clearly;
-they are never silently dropped. Distilled FLUX3 requires Refiner CFG 0 or 1; experimental Base accepts 0 through 20. Both require an empty target negative prompt.
+These targets do not accept negative text. The base prompt and AutoNeg result
+remain intact; the Refiner omits the inherited negative only for the second pass
+and records that in metadata. An explicit target negative is rejected. Use a
+separate target caption when the base contains LoRAs the target cannot use.
+Distilled FLUX.3 requires Refiner CFG 0 or 1; experimental Base accepts 0 through
+20. Select the FLUX.3 checkpoint registered by its owning extension; a raw file
+from a disabled or unmatched profile cannot be refined through Forge's generic loader.
+
+Ideogram 4 uses its own image-to-image engine, with a compatible Qwen3-VL-8B
+encoder and native FLUX.2 VAE. With **Auto** guidance, it uses a matching full
+unconditional model when available, or the locally installed Ostris
+unconditional guidance LoRA. It does not lower CFG to bypass missing weights.
+The second pass must return Ideogram's own refinement metadata before it can
+replace the base image.
 
 FLUX3 receives the decoded base image as full-frame reference conditioning using
 its packaged matching Qwen3VL/VAE and official flow-map sampler. A non-skipped
@@ -188,7 +197,5 @@ optional target steps control overrides this explicitly. Native mask/inpainting
 and variation-seed requests are rejected. Separate prompts are opt-in for other
 targets too; existing first-five script arguments retain their positions.
 
-Retained-base failures now populate returned Refiner error metadata and issue an
-available Gradio warning. CPU routing tests do not prove these model pairs on a GPU.
-These changes require a coordinated restart and genuine FLUX3, MOSS and Ideogram4
-Refiner tests; CPU tests and prior standalone generations do not prove those pairs.
+Failures retain the affected original image and report the reason in Refiner
+metadata and the available Gradio warning.

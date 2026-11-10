@@ -589,7 +589,7 @@ class Tests(unittest.TestCase):
         self.assertIn('GGUF blocked',result.comments)
 
     def test_flux_acknowledgements_are_not_bypassed(self):
-        flux=types.SimpleNamespace(selected=lambda **kwargs:True,_setting=lambda *args:False)
+        flux=types.SimpleNamespace(selected=lambda **kwargs:True,_setting=lambda *args:False,generate=Mock())
         with patch.dict(sys.modules,{'flux3_forge.bridge':flux}):
             result=self.batch_result(1)
             self.engine._finish(self.p,result)
@@ -766,16 +766,20 @@ class Tests(unittest.TestCase):
         info = types.SimpleNamespace(filename='moss-packed.safetensors')
         self.modules.sd_models.get_closet_checkpoint_match.return_value = info
         self.opts.data.update(forge_additional_modules_moss=['moss-te', 'flux2-vae'])
-        with patch.dict(sys.modules, {'forge_moss.native.assets':types.SimpleNamespace(valid_checkpoint=lambda path: True), 'model_autolink.integration':None}):
+        helper = self.engine._refiner_helper('moss_refiner')
+        schedulers = types.SimpleNamespace(schedulers_map={'Simple':object()})
+        with patch.object(helper, 'identify', return_value=True), patch.dict(sys.modules, {
+                'model_autolink.integration':None, 'modules.sd_schedulers':schedulers}):
             profile = self.engine._target_profile('target', info)
         self.p._pi_target_profile = profile
-        self.assertEqual((profile['preset'], profile['scheduler'], profile['modules']), ('moss', 'MOSS', ['moss-te', 'flux2-vae']))
+        self.assertEqual((profile['preset'], profile['scheduler'], profile['modules']), ('moss', 'Simple', ['moss-te', 'flux2-vae']))
         self.assertEqual(self.engine._target_cfg(self.p, 0), 3)
         self.assertEqual(self.engine._fast_steps(self.p, .25), 8)
 
     def test_moss_missing_backend_fails_before_switch(self):
         self.engine._target_profile = lambda *args: {'family':'moss_image'}
-        with patch.dict(sys.modules, {'forge_moss.native.patches':None}):
+        helper = self.engine._refiner_helper('moss_refiner')
+        with patch.object(helper, 'validate', side_effect=ValueError('MOSS backend is unavailable')):
             self.run_pass()
         self.entry.checkpoint_change.assert_not_called()
         self.assertIn('MOSS backend is unavailable', self.p.extra_generation_params['Refiner error'])
