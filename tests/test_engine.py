@@ -153,6 +153,84 @@ class Tests(unittest.TestCase):
         self.engine._arm(self.p)
         self.assertEqual(self.p._pi_refiner, ('target', 0, 3))
 
+    def test_api_native_fields_override_disabled_script_defaults(self):
+        native = self.native()
+        native.args_from, native.args_to = 1, 10
+        self.p.scripts = types.SimpleNamespace(alwayson_scripts=[native])
+        self.p.script_args = (0, False, 'None', .75, 0, '', False, '', '', 0)
+        self.p.is_api = True
+        self.p.refiner_checkpoint, self.p.refiner_switch_at, self.p.refiner_cfg = 'api-target', 0, 3
+        self.engine._arm(self.p)
+        self.assertEqual(self.p._pi_refiner, ('api-target', 0, 3))
+        self.assertIsNone(self.p.refiner_checkpoint)
+
+        self.engine._arm(self.p)  # Second API entry after ScriptRunner returns None.
+        self.assertEqual(self.p._pi_refiner, ('api-target', 0, 3))
+
+    def test_api_alwayson_arguments_still_enable_refiner(self):
+        native = self.native()
+        native.args_from, native.args_to = 1, 10
+        self.p.scripts = types.SimpleNamespace(alwayson_scripts=[native])
+        self.p.script_args = (0, True, 'script-target', .5, 4, '', True, 'details', '', 7)
+        self.p.is_api, self.p.refiner_checkpoint = True, None
+        self.engine._arm(self.p)
+        self.assertEqual(self.p._pi_refiner, ('script-target', .5, 4))
+        self.assertEqual(self.p._pi_refiner_text, ('details', ''))
+        self.assertEqual(self.p._pi_refiner_steps, 7)
+
+    def test_target_prompt_png_roundtrip_through_forge_parser_and_paste_fields(self):
+        import ast
+        import json
+        import os
+        import re
+        import tempfile
+        from PIL import Image, PngImagePlugin
+        source = Path(os.environ.get('FORGE_ROOT', Path(__file__).resolve().parents[3])) / 'modules/infotext_utils.py'
+        if not source.is_file():
+            self.skipTest('Forge source needed for its actual infotext parser')
+        tree = ast.parse(source.read_text(encoding='utf-8'))
+        names = {'PasteField', 'unquote', 'parse_generation_parameters'}
+        nodes = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
+        assignments = [node for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {'re_param_code', 're_param', 're_imagesize'} for t in node.targets)]
+        opts = types.SimpleNamespace(infotext_skip_pasting=[], strip_whitespaces=False, sd_model_checkpoint='base')
+        scope = dict(json=json, re=re, os=os, shared=types.SimpleNamespace(opts=opts),
+            main_entry=types.SimpleNamespace(module_list={}), uses_emphasis=lambda text: False,
+            _extract_styles=lambda res, positive, negative: (positive, negative), _populate_defaults=lambda res: None)
+        exec(compile(ast.Module(body=assignments + nodes, type_ignores=[]), str(source), 'exec'), scope)
+        class Component:
+            def __init__(self, *args, **kwargs): self.value = kwargs.get('value')
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        gr = types.SimpleNamespace(**{name: Component for name in ('Row', 'Dropdown', 'Slider', 'State', 'Accordion', 'Markdown', 'Checkbox', 'Textbox')})
+        fake_modules = {'gradio': gr, 'modules.infotext_utils': types.SimpleNamespace(PasteField=scope['PasteField']),
+            'modules.ui_common': types.SimpleNamespace(create_refresh_button=Mock()),
+            'modules.ui_components': types.SimpleNamespace(InputAccordion=Component)}
+        ui = types.SimpleNamespace(refresh_checkpoints=Mock(), ckpts=['target'], elem_id=lambda name: name)
+        with patch.dict(sys.modules, fake_modules):
+            components = self.engine._ui(ui, False)
+        positive = 'portrait, blue: coat\ntext "hello", café <lora:target:0.5>'
+        self.modules.images = types.SimpleNamespace()
+        for negative in ('', 'blur, text: bad\n"artifact"'):
+            with self.subTest(negative=negative):
+                self.p._pi_refiner_text = (positive, negative)
+                self.p._pi_refiner_steps = 7
+                self.modules.processing.process_images.return_value.images = [Image.new('RGB', (8, 8))]
+                source_image = Image.new('RGB', (8, 8))
+                base_info = 'base prompt\nSteps: 20, Sampler: Euler, CFG scale: 7'
+                result = types.SimpleNamespace(images=[source_image], index_of_first_image=0, infotexts=[base_info], info=base_info)
+                self.engine._finish(self.p, result)
+                with tempfile.TemporaryDirectory() as folder:
+                    filename = Path(folder) / 'result.png'
+                    meta = PngImagePlugin.PngInfo()
+                    meta.add_text('parameters', result.info)
+                    result.images[0].save(filename, pnginfo=meta)
+                    with Image.open(filename) as image:
+                        parsed = scope['parse_generation_parameters'](image.info['parameters'])
+                restored = {id(field.component): field.function(parsed) if field.function else parsed.get(field.label)
+                            for field in ui.infotext_fields}
+                self.assertEqual([restored[id(component)] for component in components[5:]], [True, positive, negative, 7])
+                self.assertEqual(parsed['Prompt'], 'base prompt')
+
     def test_atomic_saved_file_replacement(self):
         import tempfile
         from PIL import Image, PngImagePlugin
@@ -174,6 +252,43 @@ class Tests(unittest.TestCase):
     def distinct_checkpoints(self):
         self.infos = {}
         self.modules.sd_models.get_closet_checkpoint_match.side_effect = lambda key: self.infos.setdefault(key, types.SimpleNamespace(filename=str(key)))
+
+    def test_failed_pass_with_deferred_scale_keeps_original(self):
+        from PIL import Image
+        result = self.batch_result(1)
+        original = result.images[0] = Image.new('RGB', (8, 8))
+        self.p._pi_refiner_output_scale = 2
+        self.modules.processing.process_images.side_effect = RuntimeError('failed')
+        self.engine._rewrite_saved = Mock()
+        self.engine._finish(self.p, result)
+        self.assertIs(result.images[0], original)
+        self.engine._rewrite_saved.assert_not_called()
+
+    def test_export_collision_tracks_exact_jpg_and_rewrites_at_saved_size(self):
+        import tempfile, os
+        from PIL import Image
+        self.opts.export_for_4chan = True
+        self.p._pi_saved_files = {}
+        observer = self.engine._ImageSaveOS(os)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            main, existing, export = (folder / n for n in ('a.png', 'a.jpg', 'a-1.jpg'))
+            existing.write_bytes(b'unrelated')
+            source = Image.new('RGB', (12, 8), 'black')
+            def _atomically_save_image(image_to_save, filename):
+                tmpfile = folder / 'stage.tmp'
+                image_to_save.save(tmpfile, format='PNG' if filename == main else 'JPEG')
+                observer.replace(tmpfile, str(filename))
+            def save(image, **kwargs):
+                _atomically_save_image(image, main)
+                _atomically_save_image(image.resize((6, 4)), export)
+                return str(main), None
+            self.engine._record_save(save, source, p=self.p)
+            self.modules.images = types.SimpleNamespace(save_image_with_geninfo=lambda im, info, path, **kw: im.save(path))
+            self.engine._rewrite_saved(Image.new('RGB', (12, 8), 'white'), '', self.p._pi_saved_files[id(source)])
+            with Image.open(export) as im:
+                self.assertEqual((im.size, im.getpixel((0, 0))), ((6, 4), (255, 255, 255)))
+            self.assertEqual(existing.read_bytes(), b'unrelated')
 
     def batch_result(self, count=3):
         return types.SimpleNamespace(images=[types.SimpleNamespace(width=512,height=512,info={}) for _ in range(count)],
@@ -699,6 +814,48 @@ class Tests(unittest.TestCase):
             self.assertEqual(profile['modules'], ['target-te', 'target-vae'])
             resolver.resolve.assert_called_once_with('model.safetensors', persist=False)
 
+    def test_saved_klein_alias_keeps_detected_9b_identity_and_components(self):
+        info = types.SimpleNamespace(filename='klein9.safetensors')
+        self.modules.sd_models.get_closet_checkpoint_match.return_value = info
+        self.opts.data.update(forge_checkpoint_klein='saved alias',
+                              forge_additional_modules_klein=['stale-4b-te', 'vae'])
+        resolver = types.SimpleNamespace(
+            checkpoint=Mock(return_value=(None, types.SimpleNamespace(label='flux2_klein9'))),
+            resolve=Mock(return_value=(['9b-te', 'vae'], None, None)))
+        with patch.dict(sys.modules, {'model_autolink.integration':types.SimpleNamespace(_resolver=resolver)}):
+            profile = self.engine._target_profile('target', info)
+        self.assertEqual(profile['family'], 'flux2_klein9')
+        self.assertEqual(profile['modules'], ['9b-te', 'vae'])
+        resolver.resolve.assert_called_once_with(info.filename, persist=False)
+
+    def test_fractional_cfg_is_preserved_only_for_flux3_base(self):
+        for profile, expected in [
+                ({'family':'flux3', 'model_family':'base'}, .5),
+                ({'family':'flux3', 'model_family':'distilled'}, 1),
+                ({'family':'moss_image', 'cfg':3}, 3), ({}, 1)]:
+            self.p._pi_target_profile = profile
+            self.p._pi_refiner = ('target', .75, .5)
+            self.assertEqual(self.engine._target_cfg(self.p, .5), expected)
+            self.assertEqual(self.engine._target_cfg_for_profile(self.p, profile), expected)
+            self.assertEqual(self.engine._target_cfg(self.p, 0), profile.get('cfg', 1))
+            self.assertEqual(self.engine._target_cfg(self.p, 5), 5)
+
+    def test_ideogram_component_scan_stops_after_complete_pair(self):
+        import tempfile
+        spec = importlib.util.spec_from_file_location('ideogram_scan_test',
+            Path(__file__).parents[1] / 'lib' / 'ideogram_refiner.py')
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ('vae.safetensors', 'te.safetensors', 'extra.safetensors')]
+            for path in paths:
+                path.touch()
+            with patch.object(helper, '_header_kind', side_effect=['vae', 'te', AssertionError('unneeded scan')]) as detect:
+                found = {}
+                helper._add_valid(found, paths, object())
+            self.assertEqual(set(found), {'vae', 'te'})
+            self.assertEqual(detect.call_count, 2)
+
     def test_missing_target_components_fail_before_unloading_base(self):
         resolver = types.SimpleNamespace(
             checkpoint=lambda *args: (None, types.SimpleNamespace(label='qwen_image21')),
@@ -766,23 +923,19 @@ class Tests(unittest.TestCase):
         info = types.SimpleNamespace(filename='moss-packed.safetensors')
         self.modules.sd_models.get_closet_checkpoint_match.return_value = info
         self.opts.data.update(forge_additional_modules_moss=['moss-te', 'flux2-vae'])
-        helper = self.engine._refiner_helper('moss_refiner')
-        schedulers = types.SimpleNamespace(schedulers_map={'Simple':object()})
-        with patch.object(helper, 'identify', return_value=True), patch.dict(sys.modules, {
-                'model_autolink.integration':None, 'modules.sd_schedulers':schedulers}):
+        with patch.object(self.engine._refiner_helper('moss_refiner'), 'identify', return_value=True), patch.dict(sys.modules, {'model_autolink.integration':None, 'modules.sd_schedulers':types.SimpleNamespace(schedulers_map={'MOSS':object()})}):
             profile = self.engine._target_profile('target', info)
         self.p._pi_target_profile = profile
-        self.assertEqual((profile['preset'], profile['scheduler'], profile['modules']), ('moss', 'Simple', ['moss-te', 'flux2-vae']))
+        self.assertEqual((profile['preset'], profile['scheduler'], profile['modules']), ('moss', 'MOSS', ['moss-te', 'flux2-vae']))
         self.assertEqual(self.engine._target_cfg(self.p, 0), 3)
         self.assertEqual(self.engine._fast_steps(self.p, .25), 8)
 
     def test_moss_missing_backend_fails_before_switch(self):
         self.engine._target_profile = lambda *args: {'family':'moss_image'}
-        helper = self.engine._refiner_helper('moss_refiner')
-        with patch.object(helper, 'validate', side_effect=ValueError('MOSS backend is unavailable')):
+        with patch.dict(sys.modules, {'backend.diffusion_engine.moss_image':None}):
             self.run_pass()
         self.entry.checkpoint_change.assert_not_called()
-        self.assertIn('MOSS backend is unavailable', self.p.extra_generation_params['Refiner error'])
+        self.assertIn('no native MOSS image-to-image backend', self.p.extra_generation_params['Refiner error'])
 
     def test_moss_spectrum_forwards_only_owner_hooks(self):
         calls = []
@@ -805,6 +958,27 @@ class Tests(unittest.TestCase):
         self.modules.processing.process_images.return_value.extra_generation_params = {'MOSS Spectrum':'Off (no forecast qualified)', 'MOSS Spectrum calls':'8 real, 0 forecast, 0 rejected'}
         self.run_pass()
         self.assertEqual(self.p.extra_generation_params['Refiner MOSS Spectrum calls'], '8 real, 0 forecast, 0 rejected')
+
+    def test_moss_structural_identification_requires_both_native_keys(self):
+        helper = self.engine._refiner_helper('moss_refiner')
+        keys = ['diffusion.shared_block_modulation.weight', 'diffusion.layers.0.proj.ffn_up_gate.weight']
+        for subset, expected in [(keys, True), (keys[:1], False), (keys[1:], False), ([], False)]:
+            with self.subTest(keys=subset):
+                self.assertEqual(helper.identify('synthetic.safetensors', opener=lambda path:dict.fromkeys(subset)), expected)
+        self.assertFalse(helper.identify('missing', opener=Mock(side_effect=OSError('missing'))))
+
+    def test_moss_native_backend_contract_and_conventional_img2img(self):
+        helper = self.engine._refiner_helper('moss_refiner')
+        importer = Mock(return_value=types.SimpleNamespace(MOSSImage=type('MOSSImage', (), {})))
+        with self.assertRaisesRegex(ValueError, 'exactly'):
+            helper.validate({'family':'moss_image'}, importer=importer)
+        importer.assert_called_once_with('backend.diffusion_engine.moss_image')
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            helper.validate({'family':'moss_image'}, importer=lambda name:types.SimpleNamespace())
+        job = types.SimpleNamespace(override_settings={'other':'preserved'}, extra_generation_params={})
+        helper.configure_job(job, {'family':'moss_image'})
+        self.assertEqual(job.override_settings, {'other':'preserved', 'moss_do_reference':'Disable'})
+        self.assertIn('conventional img2img', job.extra_generation_params['MOSS refiner input mode'])
 
 if __name__ == '__main__':
     unittest.main()

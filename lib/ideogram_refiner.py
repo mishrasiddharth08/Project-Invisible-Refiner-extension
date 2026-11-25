@@ -40,6 +40,8 @@ def _validated_pair(paths, detect):
 
 def _add_valid(found, paths, detect):
     for value in paths or ():
+        if set(found) == {'vae', 'te'}:
+            break
         path = Path(str(value))
         if path.is_file():
             kind = _header_kind(path, detect)

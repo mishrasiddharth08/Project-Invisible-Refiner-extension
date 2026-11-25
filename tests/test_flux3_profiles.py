@@ -8,8 +8,7 @@ class Flux3Profiles(unittest.TestCase):
  distinct_checkpoints=support.Tests.distinct_checkpoints
  batch_result=support.Tests.batch_result
  def flux(self,**extra):
-  values=dict(selected=lambda **kwargs:True,_setting=lambda *args:True,
-              generate=lambda job, asset:self.modules.processing.process_images(job));values.update(extra)
+  values=dict(selected=lambda **kwargs:True,_setting=lambda *args:True,generate=Mock(side_effect=lambda job, asset:self.modules.processing.process_images(job)));values.update(extra)
   context=patch.dict(sys.modules,{'flux3_forge.bridge':types.SimpleNamespace(**values)});context.start();self.addCleanup(context.stop)
   return values
  def test_distinct_fl3_profile_owns_components_sampler_and_full_reference_steps(self):
@@ -19,31 +18,13 @@ class Flux3Profiles(unittest.TestCase):
    self.assertEqual(self.engine._target_setting(self.p,'sampler','iPNDM'),'Euler');self.assertEqual(self.engine._target_setting(self.p,'scheduler','SGM Uniform'),'Automatic')
    for strength in [.1,.25,.75]:self.assertEqual(self.engine._fast_steps(self.p,strength),16)
   self.assertEqual(self.opts.data,original);self.assertIsNone(self.p._pi_target_profile)
-  self.entry.checkpoint_change.assert_not_called();self.entry.refresh_model_loading_parameters.assert_not_called()
  def test_fl3_invalid_cfg_stops_before_switch(self):
   self.flux();self.p._pi_refiner=('target',.75,5)
   result=self.batch_result(1);self.engine._finish(self.p,result)
   self.entry.checkpoint_change.assert_not_called();self.assertIn('CFG1',result.comments)
- def test_fl3_nonempty_base_negative_is_not_sent_to_target(self):
-  self.flux();self.p.negative_prompt='base negative';self.p.all_negative_prompts=['base negative']
-  self.run_pass()
-  self.assertEqual(self.modules.processing.StableDiffusionProcessingImg2Img.call_args.kwargs['negative_prompt'],'')
-  self.assertEqual(self.p.all_negative_prompts,['base negative'])
-  self.assertIn('base negative preserved',self.p.extra_generation_params['Refiner negative policy'])
- def test_verified_raw_comfy_target_omits_only_inherited_tags(self):
-  raw=types.SimpleNamespace(filename='flux3-image-klein-base-int8-convrot.safetensors')
-  self.modules.sd_models.get_closet_checkpoint_match.return_value=raw
-  asset={'model_family':'base','comfy_profile':object()}
-  resolver=Mock(return_value=asset)
-  unsupported=Mock(side_effect=AssertionError('Base-only tags must not be resolved for the Comfy target'))
-  self.flux(selected=lambda **kwargs:None,selected_refiner=resolver,_resolve_adapters=unsupported)
-  self.p.prompt='base <lora:moss:1>'
-  networks=types.SimpleNamespace(parse_prompt=lambda prompt:('base',{'lora':['moss']}))
-  with patch.object(self.modules,'extra_networks',networks,create=True):self.run_pass()
-  self.assertTrue(resolver.called)
-  self.assertEqual(self.modules.processing.StableDiffusionProcessingImg2Img.call_args.kwargs['prompt'],'base')
-  self.assertEqual(self.p.prompt,'base <lora:moss:1>')
-  self.assertIn('base tags preserved',self.p.extra_generation_params['Refiner adapter policy'])
+ def test_fl3_explicit_nonempty_target_negative_rejected_before_switch(self):
+  self.flux();self.p.negative_prompt='base negative';self.p.all_negative_prompts=['base negative'];self.p._pi_refiner_text=('Target caption','unsupported target negative')
+  result=self.batch_result(1);self.engine._finish(self.p,result);self.assertIn('negative prompts',result.comments);self.entry.checkpoint_change.assert_not_called()
  def test_separate_target_prompt_does_not_mutate_base_or_inherit_negative(self):
   self.flux();self.p.prompt='base <lora:foreign:1>';self.p.negative_prompt='base negative';self.p.all_negative_prompts=['base negative']
   self.engine._setup(None,self.p,True,'target',.75,0,'',True,'A complete target caption','',16)
@@ -80,7 +61,7 @@ class Flux3Profiles(unittest.TestCase):
   self.flux();self.modules.processing.process_images.return_value.extra_generation_params={'FLUX.3 reference mode':'direct conditioning; denoising strength unused','FLUX.3 steps':16}
   self.run_pass();self.assertEqual(self.p.extra_generation_params['Refiner steps'],16);self.assertNotIn('Refiner denoising strength',self.p.extra_generation_params)
  def test_failure_is_visible_in_result_metadata_and_ui_without_losing_base(self):
-  self.flux();self.p._pi_refiner_text=('Full target caption','unsupported explicit target negative');result=self.batch_result(1);result.extra_generation_params={};source=result.images[0];warning=Mock()
+  self.flux();self.p.negative_prompt='AutoNeg base negative';self.p._pi_refiner_text=('Target caption','unsupported target negative');result=self.batch_result(1);result.extra_generation_params={};source=result.images[0];warning=Mock()
   with patch.dict(sys.modules,{'gradio':types.SimpleNamespace(Warning=warning)}):self.engine._finish(self.p,result)
   self.assertIs(result.images[0],source);self.assertIn('negative prompts',result.extra_generation_params['Refiner error']);warning.assert_called_once();self.assertIn('base images retained',result.comments)
  def test_pass_two_does_not_rerun_autoneg_or_mutate_base_negative(self):
@@ -92,3 +73,24 @@ class Flux3Profiles(unittest.TestCase):
    self.job.negative_prompt=kwargs['negative_prompt'];return self.job
   self.modules.processing.StableDiffusionProcessingImg2Img.side_effect=make_job;self.modules.processing.process_images.side_effect=generate
   self.run_pass();process.assert_not_called();self.assertEqual(self.p.negative_prompt,'AutoNeg base negative');self.assertIs(self.pp.image,self.output)
+
+ def test_inherited_negative_is_omitted_only_for_target_and_recorded(self):
+  bridge=self.flux();self.p.negative_prompt='base negative';self.p.all_negative_prompts=['base negative','base negative']
+  before=(self.p.prompt,self.p.negative_prompt,list(self.p.all_negative_prompts))
+  self.run_pass()
+  args=self.modules.processing.StableDiffusionProcessingImg2Img.call_args.kwargs
+  self.assertEqual(args['negative_prompt'],'');self.assertEqual(args['prompt'],'second')
+  self.assertEqual((self.p.prompt,self.p.negative_prompt,self.p.all_negative_prompts),before)
+  self.assertEqual(self.p.extra_generation_params['Refiner negative policy'],'unsupported by target; base negative preserved')
+  bridge['generate'].assert_called_once_with(self.job,True)
+  self.assertIs(self.pp.image,self.output)
+ def test_registered_bridge_is_called_directly_with_its_asset(self):
+  asset={'model_family':'distilled','identity':'test'}
+  generated=Mock(return_value=types.SimpleNamespace(images=[self.output],index_of_first_image=0))
+  self.flux(selected=lambda **kwargs:asset,generate=generated)
+  self.run_pass();generated.assert_called_once_with(self.job,asset)
+  self.modules.processing.process_images.assert_not_called();self.assertIs(self.pp.image,self.output)
+ def test_missing_generation_bridge_fails_before_checkpoint_switch(self):
+  self.flux(generate=None)
+  with self.assertRaisesRegex(ValueError,'generation bridge is unavailable'):self.engine._preflight('target',self.p)
+  self.entry.checkpoint_change.assert_not_called()

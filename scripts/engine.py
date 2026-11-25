@@ -1,6 +1,7 @@
 """Use Forge Neo's native Refiner controls for a decoded-image second pass."""
 import copy
 import logging
+from contextvars import ContextVar
 from contextlib import contextmanager, ExitStack
 from modules import scripts, script_callbacks, processing, shared, sd_models
 
@@ -11,6 +12,28 @@ _wrappers = []
 _enabled = True
 _lifecycle_token = object()
 _DLSS_TARGET = 'DLSS 5 Neural Rendering'
+_export_writes = ContextVar('pi_refiner_export_writes', default=None)
+_save_observer = None
+
+
+class _ImageSaveOS:
+    """Observe exact JPEG destinations chosen by Forge's collision handling."""
+    def __init__(self, original):
+        self.original = original
+
+    def __getattr__(self, key):
+        return getattr(self.original, key)
+
+    def replace(self, source, destination):
+        result = self.original.replace(source, destination)
+        writes = _export_writes.get()
+        if writes is not None and str(destination).lower().endswith('.jpg'):
+            import sys
+            caller = sys._getframe(1)
+            image = caller.f_locals.get('image_to_save')
+            if caller.f_code.co_name == '_atomically_save_image' and image is not None:
+                writes.append((str(destination), image.size))
+        return result
 
 
 def _dlss_backend():
@@ -76,7 +99,11 @@ def _ui(self, is_img2img):
     self.infotext_fields = [PasteField(enabled, lambda d: 'Refiner' in d),
         PasteField(checkpoint, 'Refiner', api='refiner_checkpoint'),
         PasteField(switch, 'Refiner switch at', api='refiner_switch_at'),
-        PasteField(cfg, 'Refiner CFG scale', api='refiner_cfg')]
+        PasteField(cfg, 'Refiner CFG scale', api='refiner_cfg'),
+        PasteField(separate, lambda d: d.get('Refiner separate prompts') == 'True'),
+        PasteField(target_prompt, lambda d: d.get('Refiner positive prompt', '')),
+        PasteField(target_negative, lambda d: d.get('Refiner negative prompt', '')),
+        PasteField(target_steps, lambda d: int(d.get('Refiner requested steps', 0)))]
     return [enabled, checkpoint, switch, cfg, replacements, separate, target_prompt, target_negative, target_steps]
 
 
@@ -220,12 +247,16 @@ class Script(scripts.Script):
             if guidance:
                 p.extra_generation_params['Refiner Ideogram 4 guidance path'] = guidance
             if getattr(p, '_pi_refiner_text', None) is not None:
+                p.extra_generation_params['Refiner separate prompts'] = True
+                p.extra_generation_params['Refiner positive prompt'] = p._pi_refiner_text[0]
+                p.extra_generation_params['Refiner negative prompt'] = p._pi_refiner_text[1]
                 p.extra_generation_params['Refiner prompts'] = 'explicit target prompts; base unchanged'
                 p.extra_generation_params['Refiner negative policy'] = 'explicit target negative; base/AutoNeg unchanged'
             elif omit_negative and str(negative or '').strip():
                 p.extra_generation_params['Refiner negative policy'] = 'unsupported by target; base negative preserved'
             if omitted_tags:
                 p.extra_generation_params['Refiner adapter policy'] = 'target does not support adapters; base tags preserved'
+            p.extra_generation_params['Refiner requested steps'] = getattr(p, '_pi_refiner_steps', 0)
             for key, value in extra.items():
                 if key.startswith(('Ideogram 4 refiner', 'FIBO ', 'MOSS ')):
                     p.extra_generation_params['Refiner ' + key] = value
@@ -267,6 +298,12 @@ script_callbacks.on_before_ui(_install)
 
 
 def _unload():
+    global _save_observer
+    if _save_observer:
+        owner, observer = _save_observer
+        if owner.os is observer:
+            owner.os = observer.original
+        _save_observer = None
     global _enabled
     _enabled = False
     for cls, original in _original_setups.items():
@@ -324,7 +361,7 @@ def _generation_error(output):
     return info if isinstance(info, str) and info.startswith('Ideogram 4 error:') else None
 
 
-def _report_refiner_error(p, result, error):
+def _report_refiner_error(p, result, error, outcome='Refiner failed; base images retained'):
     """Expose retained-base failure in result metadata and the running UI."""
     import sys
     message = str(error)
@@ -333,10 +370,10 @@ def _report_refiner_error(p, result, error):
     p.extra_generation_params['Refiner error'] = message
     extra = getattr(result,'extra_generation_params',None)
     if isinstance(extra,dict): extra['Refiner error'] = message
-    result.comments = (getattr(result,'comments','') or '') + '\nRefiner failed; base images retained: ' + message
+    result.comments = (getattr(result,'comments','') or '') + '\n' + outcome + ': ' + message
     notice = getattr(sys.modules.get('gradio'),'Warning',None)
     if callable(notice):
-        try: notice('Refiner failed; base images retained: '+message)
+        try: notice(outcome + ': ' + message)
         except Exception: log.warning('Could not display the Refiner warning; failure remains in metadata.')
 
 
@@ -474,7 +511,7 @@ def _target_profile(checkpoint, info):
     flux, asset = _flux3_target(checkpoint, info)
     if asset is not None:
         is_base=isinstance(asset,dict) and asset.get('model_family')=='base'
-        return {'family':'flux3','preset':'flux3','modules':[], 'external':True,
+        return {'family':'flux3','preset':'flux3','modules':[], 'external':True, 'model_family':'base' if is_base else 'distilled',
                 'comfy_profile':isinstance(asset,dict) and asset.get('comfy_profile') is not None,
                 'generate': lambda job: flux.generate(job, asset),
                 'sampler':'Euler','scheduler':'Automatic','steps':25 if is_base else 16}
@@ -523,6 +560,8 @@ def _target_profile(checkpoint, info):
         except (RuntimeError, ValueError, OSError):
             match = None
         family = getattr(match, 'label', None)
+        if profile.get('preset') == 'klein' and family in ('flux2_klein4', 'flux2_klein9'):
+            profile['family'] = family
         expected_families = {profile.get('family')}
         if profile.get('family') == 'fibo2' and profile.get('variant') == 'dev':
             expected_families.add('fibo2_dev')
@@ -554,6 +593,8 @@ def _native_profile(family, preset):
 
 def _target_cfg(p, cfg):
     profile = getattr(p, '_pi_target_profile', None) or {}
+    if profile.get('family') == 'flux3' and profile.get('model_family') == 'base' and cfg is not None and 0 < cfg < 1:
+        return cfg
     return cfg if cfg is not None and cfg >= 1 else profile.get('cfg', 1.0)
 
 
@@ -581,6 +622,8 @@ def _validate_target_request(p, profile):
 
 def _target_cfg_for_profile(p, profile):
     cfg = (getattr(p, '_pi_refiner', None) or (None, None, 0))[2]
+    if profile.get('family') == 'flux3' and profile.get('model_family') == 'base' and cfg is not None and 0 < cfg < 1:
+        return cfg
     return cfg if cfg is not None and cfg >= 1 else profile.get('cfg', 1.0)
 
 
@@ -808,6 +851,27 @@ class _OptionsOnlyRunner:
 def _arm(p, runner=None, ui_args=None):
     if getattr(p, '_pi_refining', False):
         return
+    # Forge's API supplies disabled UI defaults even when native refiner fields
+    # are explicitly provided. Builtin UI setup is skipped for API requests.
+    checkpoint = getattr(p, 'refiner_checkpoint', None)
+    if getattr(p, 'is_api', False):
+        if checkpoint not in (None, '', 'None'):
+            switch = getattr(p, 'refiner_switch_at', None)
+            p._pi_api_refiner = (checkpoint, .75 if switch is None else switch,
+                                 getattr(p, 'refiner_cfg', 0))
+        native = getattr(p, '_pi_api_refiner', None)
+        if native:
+            # ScriptRunner.run can return None before the API calls process_images.
+            # Native latent switching stays disabled across both entry points.
+            active_runner = runner or getattr(p, 'scripts', None)
+            values = ui_args if ui_args is not None else getattr(p, 'script_args', ())
+            extra = ()
+            for script in getattr(active_runner, 'alwayson_scripts', ()):
+                if type(script).__name__ == 'ScriptRefiner':
+                    extra = values[script.args_from:script.args_to][4:]
+                    break
+            _setup(None, p, True, *native, *extra)
+            return
     runner = runner or getattr(p, 'scripts', None)
     values = ui_args if ui_args is not None else getattr(p, 'script_args', ())
     for script in getattr(runner, 'alwayson_scripts', ()):
@@ -832,10 +896,22 @@ def _record_save(original, image, *args, **kwargs):
             p = inspect.signature(original).bind_partial(image, *args, **kwargs).arguments.get('p')
         except (TypeError, ValueError):
             p = None
-    result = original(image, *args, **kwargs)
     records = getattr(p, '_pi_saved_files', None)
+    track = records is not None and not getattr(p, '_pi_refining', False)
+    writes = [] if track and getattr(shared.opts, 'export_for_4chan', False) else None
+    token = _export_writes.set(writes)
+    try:
+        result = original(image, *args, **kwargs)
+    finally:
+        _export_writes.reset(token)
     if records is not None and not getattr(p, '_pi_refining', False) and result and result[0]:
         records.setdefault(id(image), []).append((result[0], result[1] if len(result) > 1 else None))
+        for destination, size in writes or ():
+            # The primary JPG may also be the export when Forge uses Override.
+            if destination == result[0]:
+                records[id(image)][-1] = (*records[id(image)][-1][:2], size)
+            else:
+                records[id(image)].append((destination, None, size))
         grids = getattr(p, '_pi_saved_grids', None)
         if grids is not None and kwargs.get('grid', False):
             grids.append((id(image), kwargs.get('info')))
@@ -863,14 +939,18 @@ def _rewrite_saved(image, info, records):
     try:
         # Stage every image/sidecar before changing any existing output.
         # This keeps gallery and disk consistent if one format or text write fails.
-        for filename, textfile in records:
+        for filename, textfile, *export_size in records:
             target = Path(filename)
             identity = os.path.normcase(os.path.abspath(target))
             if identity in seen:
                 continue
             seen.add(identity)
             name = temporary(target)
-            images.save_image_with_geninfo(image, info, name, existing_pnginfo=dict(image.info))
+            saved = image
+            if export_size and image.size != export_size[0]:
+                from PIL import Image
+                saved = image.resize(export_size[0], Image.Resampling.LANCZOS)
+            images.save_image_with_geninfo(saved, info, name, existing_pnginfo=dict(image.info))
             plans.append((target, name))
             if textfile and Path(textfile).is_file():
                 text_target = Path(textfile)
@@ -934,6 +1014,16 @@ def _finish(p, result):
         p._pi_external_finish = False
 
 
+def _refiner_details(p):
+    """Escape prompt punctuation/newlines using Forge's infotext convention."""
+    import json
+    def quoted(value):
+        text = str(value)
+        return json.dumps(text, ensure_ascii=False) if not text or any(c in text for c in ',\n:\"') else text
+    return ', '.join(f'{key}: {quoted(value)}' for key, value in p.extra_generation_params.items()
+                     if key.startswith('Refiner') and key != 'Refiner error')
+
+
 def _finish_images(p, result):
     if result is None or getattr(p, '_pi_standard_callback', False):
         return result
@@ -977,6 +1067,7 @@ def _finish_images(p, result):
     if isinstance(pixels, list) and pixels is not samples:
         pixels.clear()
     changed = False
+    completed = 0
     failures = []
     # Takeover engines may construct their own prompts/seeds without filling p.
     old = {k: (hasattr(p, k), getattr(p, k, None)) for k in
@@ -997,11 +1088,16 @@ def _finish_images(p, result):
                 if error:
                     failures.append(f'Image {sample_index + 1}: {error}')
                 continue
+            scale = getattr(p, '_pi_refiner_output_scale', None)
+            if scale is not None:
+                from PIL import Image
+                size = tuple(max(1, round(side * scale)) for side in pp.image.size)
+                pp.image = pp.image.resize(size, Image.Resampling.LANCZOS)
             info_list = getattr(result, 'infotexts', [])
             info_index = index if len(info_list) == len(samples) else sample_index + first
             info = info_list[info_index] if info_index < len(info_list) else getattr(result, 'info', '')
-            details = ', '.join(f'{k}: {v}' for k, v in p.extra_generation_params.items() if k.startswith('Refiner') and k != 'Refiner error')
-            info = (info or '') + ', ' + details
+            details = _refiner_details(p)
+            info = (info or '') + (', ' + details if details else '')
             pp.image.info.update(getattr(source, 'info', {}))
             pp.image.info['parameters'] = info
             try:
@@ -1013,6 +1109,7 @@ def _finish_images(p, result):
                 continue
             samples[index] = pp.image
             changed = True
+            completed += 1
             if info_index < len(info_list):
                 info_list[info_index] = info
             if sample_index == 0:
@@ -1022,7 +1119,7 @@ def _finish_images(p, result):
         if changed and (first == 1 or grid_records):
             from modules import images
             grid = images.image_grid([samples[index] for index, _ in slots], getattr(p, 'batch_size', 1))
-            details = ', '.join(f'{k}: {v}' for k, v in p.extra_generation_params.items() if k.startswith('Refiner') and k != 'Refiner error')
+            details = _refiner_details(p)
             grid_info = (grid_info_original or '') + ', ' + details
             grid.info['parameters'] = grid_info
             if first == 1:
@@ -1052,7 +1149,8 @@ def _finish_images(p, result):
             result.extra_generation_params.update(p.extra_generation_params)
         error = p.extra_generation_params.get('Refiner error')
         if error:
-            _report_refiner_error(p,result,error)
+            outcome = f'Refined {completed} of {len(slots)} images' if completed else 'Refiner failed; base images retained'
+            _report_refiner_error(p,result,error,outcome)
         return result
     finally:
         for key, (existed, value) in old.items():
@@ -1108,6 +1206,8 @@ def _dispatch(original, p, args, kwargs, runner=None):
     if not getattr(p, '_pi_refiner', None):
         return original(*args, **kwargs)
     p._pi_dispatching = True
+    p._pi_refiner_can_resize_output = p._pi_refiner[1] < 1
+    p._pi_refiner_output_scale = None
     p._pi_standard_callback = False
     p._pi_saved_files = {}
     p._pi_deferred_slots = []
@@ -1118,6 +1218,8 @@ def _dispatch(original, p, args, kwargs, runner=None):
         return _finish(p, result)
     finally:
         p._pi_dispatching = False
+        p._pi_refiner_can_resize_output = False
+        p._pi_refiner_output_scale = None
         p._pi_saved_files = None
         p._pi_deferred_slots = None
         p._pi_saved_grids = None
@@ -1142,8 +1244,13 @@ def _patch(owner, name, make):
 
 
 def _install_routes(*unused):
+    global _save_observer
     import sys
     from modules import images
+    if _save_observer is None and hasattr(images, 'os'):
+        observer = _ImageSaveOS(images.os)
+        images.os = observer
+        _save_observer = images, observer
     _patch(scripts.ScriptRunner, 'run', lambda original:
           lambda runner, p, *args, **kwargs: _dispatch(original, p, (runner, p, *args), kwargs, runner))
     # Patch aliases after all generation extensions have installed their routes.
