@@ -277,20 +277,31 @@ class Tests(unittest.TestCase):
         self.assertIs(result.images[0], original)
         self.engine._rewrite_saved.assert_not_called()
 
-    def test_before_refiner_preserves_base_and_avoids_collisions(self):
-        from PIL import Image
+    def test_both_modes_replace_saved_png_even_with_legacy_comparison_enabled(self):
         import tempfile
-        with tempfile.TemporaryDirectory() as folder:
-            original = Path(folder)/'sample.png'
-            Image.new('RGB', (8, 8), 'black').save(original)
-            before = original.read_bytes()
-            kept = self.engine._keep_before_image(original)
-            second = self.engine._keep_before_image(original)
-            self.assertNotEqual(kept, second)
-            self.modules.images = types.SimpleNamespace(save_image_with_geninfo=lambda image,info,name,**kw:image.save(name))
-            self.engine._rewrite_saved(Image.new('RGB', (8, 8), 'white'), '', [(str(original),None)])
-            self.assertEqual(kept.read_bytes(), before)
-            self.assertNotEqual(original.read_bytes(), before)
+        from PIL import Image, PngImagePlugin
+
+        def save(image, info, filename, **kwargs):
+            metadata = PngImagePlugin.PngInfo()
+            metadata.add_text('parameters', info)
+            image.save(filename, pnginfo=metadata)
+
+        self.modules.images = types.SimpleNamespace(save_image_with_geninfo=save)
+        for mode in (self.engine._FINAL_ONLY, self.engine._LAST_STEPS):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                self.engine._setup(None, self.p, True, 'target', .75, 1, keep_before=True, mode=mode)
+                target = Path(folder) / 'sample.png'
+                source = Image.new('RGB', (8, 8), 'black')
+                source.save(target)
+                result = types.SimpleNamespace(images=[source], info='base', infotexts=['base'])
+                self.p._pi_saved_files = {id(source): [(str(target), None)]}
+                self.modules.processing.process_images.return_value.images = [Image.new('RGB', (8, 8), 'white')]
+                self.engine._finish(self.p, result)
+                self.assertEqual(list(Path(folder).iterdir()), [target])
+                with Image.open(target) as final:
+                    self.assertEqual(final.getpixel((0, 0)), (255, 255, 255))
+                    self.assertIn('Refiner: target', final.info['parameters'])
+                    self.assertEqual(final.tobytes(), result.images[0].tobytes())
 
     def test_export_collision_tracks_exact_jpg_and_rewrites_at_saved_size(self):
         import tempfile, os

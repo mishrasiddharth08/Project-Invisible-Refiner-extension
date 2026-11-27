@@ -78,9 +78,9 @@ Refinement can change text, faces, and details. Metadata records the target, str
 3. Select the target checkpoint; select the base checkpoint again for same-model refinement.
 4. Choose **Refiner only** or **Last steps + refiner**. At **Switch at 0.75**, a compatible 20-step Euler run uses 15 base steps, 5 target steps, then a final image pass. A value of 1 skips both target stages.
 5. Press **Generate**. Check generation parameters and the terminal for errors.
-6. Leave **Save before-refiner image** enabled to compare the two stages. When Forge saves the sample, its original filename shows the final result. The file ending in `-before-refiner` shows the base image from the same run.
+6. Both modes replace the PNG saved by the base pass with the refined pixels and generation details. The filename stays the same.
 
-The last-step option checks native SD 1.x and FLUX.1-dev checkpoint headers and uses the existing base encoders and VAE for sampling. Use distinct compatible floating-point safetensors and native Euler with Hires fix and ControlNet off. Other combinations, including Qwen 2.1 to FLUX.2 Klein, use the final image pass only. Generation details record the actual mode, handoff step or fallback reason. The before-refiner file shows the image immediately before the final pass.
+The last-step option checks native SD 1.x and FLUX.1-dev checkpoint headers and uses the existing base encoders and VAE for sampling. Use distinct compatible floating-point safetensors and native Euler with Hires fix and ControlNet off. Other combinations, including Qwen 2.1 to FLUX.2 Klein, use the final image pass only. Generation details record the actual mode, handoff step or fallback reason.
 
 ## Beginner installation
 
