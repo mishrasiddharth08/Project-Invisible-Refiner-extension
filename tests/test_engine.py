@@ -228,7 +228,7 @@ class Tests(unittest.TestCase):
                         parsed = scope['parse_generation_parameters'](image.info['parameters'])
                 restored = {id(field.component): field.function(parsed) if field.function else parsed.get(field.label)
                             for field in ui.infotext_fields}
-                self.assertEqual([restored[id(component)] for component in components[5:]], [True, positive, negative, 7])
+                self.assertEqual([restored[id(component)] for component in components[5:9]], [True, positive, negative, 7])
                 self.assertEqual(parsed['Prompt'], 'base prompt')
 
     def test_atomic_saved_file_replacement(self):
@@ -263,6 +263,21 @@ class Tests(unittest.TestCase):
         self.engine._finish(self.p, result)
         self.assertIs(result.images[0], original)
         self.engine._rewrite_saved.assert_not_called()
+
+    def test_before_refiner_preserves_base_and_avoids_collisions(self):
+        from PIL import Image
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            original = Path(folder)/'sample.png'
+            Image.new('RGB', (8, 8), 'black').save(original)
+            before = original.read_bytes()
+            kept = self.engine._keep_before_image(original)
+            second = self.engine._keep_before_image(original)
+            self.assertNotEqual(kept, second)
+            self.modules.images = types.SimpleNamespace(save_image_with_geninfo=lambda image,info,name,**kw:image.save(name))
+            self.engine._rewrite_saved(Image.new('RGB', (8, 8), 'white'), '', [(str(original),None)])
+            self.assertEqual(kept.read_bytes(), before)
+            self.assertNotEqual(original.read_bytes(), before)
 
     def test_export_collision_tracks_exact_jpg_and_rewrites_at_saved_size(self):
         import tempfile, os

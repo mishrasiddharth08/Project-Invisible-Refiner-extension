@@ -76,6 +76,7 @@ Refinement can change text, faces, and details. Metadata records the target, str
 3. Select the target checkpoint; select the base checkpoint again for same-model refinement.
 4. Start with **Switch at 0.75**. Adjust CFG only if needed.
 5. Press **Generate**. Check generation parameters and the terminal for errors.
+6. Leave **Save before-refiner image** enabled to compare the two stages. When Forge saves the sample, its original filename shows the final result. The file ending in `-before-refiner` shows the base image from the same run.
 
 ## Beginner installation
 

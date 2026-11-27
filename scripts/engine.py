@@ -58,13 +58,14 @@ def _checkpoint_choices(choices):
 
 
 def _setup(self, p, enabled, checkpoint, switch, cfg, replacements='', separate_prompt=False,
-           target_prompt='', target_negative='', target_steps=0, *args, **kwargs):
+           target_prompt='', target_negative='', target_steps=0, keep_before=False, *args, **kwargs):
     # No persistent option writes or hidden LoRA substitution rules.
     p._pi_refiner = (checkpoint, float(switch), cfg) if enabled and checkpoint not in (None, '', 'None') else None
     p.refiner_checkpoint = p.refiner_switch_at = p.refiner_checkpoint_info = None
     p.refiner_cfg = None
     p._pi_refiner_text = (str(target_prompt), str(target_negative)) if separate_prompt else None
     p._pi_refiner_steps = target_steps
+    p._pi_keep_before = bool(keep_before)
 
 
 def _ui(self, is_img2img):
@@ -87,6 +88,8 @@ def _ui(self, is_img2img):
                             label='Refiner CFG', elem_id=self.elem_id('cfg'), info='0 selects the target default: usually 1; MOSS uses its saved CFG (default 3), FIBO 2.0 Dev uses 5.')
         # Retain argument positions for existing presets, without a textbox.
         replacements = gr.State('')
+        keep_before = gr.Checkbox(value=True, label='Save before-refiner image',
+            info='Keep the original beside the final image for a same-seed comparison.')
         with gr.Accordion('Refiner target settings', open=False):
             gr.Markdown('FLUX3 distilled requires CFG1; experimental Base accepts CFG0..20. Both require an empty target negative. AutoNeg can stay enabled for the base stage: explicitly enable separate refiner prompts and leave the target negative empty. FLUX3 does not gain negative-prompt support from this separation.')
             separate = gr.Checkbox(value=False, label='Use separate refiner prompts',
@@ -104,7 +107,7 @@ def _ui(self, is_img2img):
         PasteField(target_prompt, lambda d: d.get('Refiner positive prompt', '')),
         PasteField(target_negative, lambda d: d.get('Refiner negative prompt', '')),
         PasteField(target_steps, lambda d: int(d.get('Refiner requested steps', 0)))]
-    return [enabled, checkpoint, switch, cfg, replacements, separate, target_prompt, target_negative, target_steps]
+    return [enabled, checkpoint, switch, cfg, replacements, separate, target_prompt, target_negative, target_steps, keep_before]
 
 
 def _value(p, name, index, fallback):
@@ -918,6 +921,34 @@ def _record_save(original, image, *args, **kwargs):
     return result
 
 
+def _keep_before_image(filename):
+    """Keep the exact saved base, including metadata, before atomic replacement."""
+    import os
+    import shutil
+    from pathlib import Path
+    source = Path(filename)
+    n = 0
+    while True:
+        extra = f'-{n}' if n else ''
+        target = source.with_name(f'{source.stem}-before-refiner{extra}{source.suffix}')
+        try:
+            try:
+                os.link(source, target)
+            except FileExistsError:
+                raise
+            except OSError:
+                with source.open('rb') as src, target.open('xb') as dst:
+                    try:
+                        shutil.copyfileobj(src, dst)
+                    except BaseException:
+                        dst.close()
+                        target.unlink()
+                        raise
+            return target
+        except FileExistsError:
+            n += 1
+
+
 def _rewrite_saved(image, info, records):
     """Replace precisely the files the base pass saved; no duplicate filenames."""
     import os
@@ -1101,7 +1132,13 @@ def _finish_images(p, result):
             pp.image.info.update(getattr(source, 'info', {}))
             pp.image.info['parameters'] = info
             try:
-                _rewrite_saved(pp.image, info, getattr(p, '_pi_saved_files', {}).get(id(source), []))
+                records = getattr(p, '_pi_saved_files', {}).get(id(source), [])
+                if records and getattr(p, '_pi_keep_before', False):
+                    try:
+                        _keep_before_image(records[0][0])
+                    except OSError:
+                        log.exception('Could not save the before-refiner comparison image')
+                _rewrite_saved(pp.image, info, records)
             except Exception as exc:
                 p.extra_generation_params['Refiner error'] = 'Saving refined image failed: ' + str(exc)
                 failures.append(f'Image {sample_index + 1}: saving refined image failed: {exc}')
