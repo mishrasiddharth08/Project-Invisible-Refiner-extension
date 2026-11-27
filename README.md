@@ -78,7 +78,9 @@ Refinement can change text, faces, and details. Metadata records the target, str
 3. Select the target checkpoint; select the base checkpoint again for same-model refinement.
 4. Choose **Refiner only** or **Last steps + refiner**. At **Switch at 0.75**, a compatible 20-step Euler run uses 15 base steps, 5 target steps, then a final image pass. A value of 1 skips both target stages.
 5. Press **Generate**. Check generation parameters and the terminal for errors.
-6. Both modes replace the PNG saved by the base pass with the refined pixels and generation details. The filename stays the same.
+6. Forge saves the refined pixels and generation details under the usual filename. With a decoded image handoff, the intermediate preview stays in memory until both target passes finish. The final pass uses at most 20% denoising to limit repeated redraw. The image metadata records each pass’s strength.
+
+When **Last steps + refiner** is selected for a **Qwen 2.1 Head Swap** using donor photos, Qwen finishes every base step with the photos and identity LoRA. The target receives the finished picture for one pass at up to 20% denoising. The saved metadata records this fallback. Selecting **Refiner only** uses your normal Switch at strength.
 
 Compatible native SD 1.x and FLUX.1-dev pairs can switch directly during Euler sampling. For supported cross-family pairs, Forge decodes the intermediate prediction at **Switch at**. The target encodes that image using its own VAE, runs the remaining step budget with its img2img settings, then runs the final refinement pass. The base scheduler determines the intermediate prediction. Generation details record the handoff step, continuation steps and final steps separately.
 

@@ -134,7 +134,7 @@ class Script(scripts.Script):
     def ui(self, is_img2img):
         return []
 
-    def postprocess_image_after_composite(self, p, pp, *args, continuation_steps=0):
+    def postprocess_image_after_composite(self, p, pp, *args, continuation_steps=0, finishing_bridge=False):
         # Finish the base batch before changing models. This avoids reloading
         # both models for every image, and never switches during a live sampler.
         if getattr(p, '_pi_dispatching', False) and not getattr(p, '_pi_external_finish', False):
@@ -151,6 +151,9 @@ class Script(scripts.Script):
             return
         checkpoint, switch, cfg = spec
         strength = max(0.0, min(1.0, 1.0 - switch))
+        if finishing_bridge or _needs_donor_conditioning(p):
+            # Preserve detail after continuation or a completed donor-guided edit.
+            strength = min(strength, 0.2)
         if strength == 0:
             return
         if checkpoint == _DLSS_TARGET:
@@ -262,6 +265,7 @@ class Script(scripts.Script):
                 if reference is not None:
                     p.extra_generation_params['Refiner Klein reference conditioning'] = bool(reference)
             if continuation_steps:
+                p.extra_generation_params['Refiner continuation strength'] = strength
                 p.extra_generation_params['Refiner continuation sampler'] = p.extra_generation_params['Refiner sampler']
                 p.extra_generation_params['Refiner continuation scheduler'] = p.extra_generation_params['Refiner scheduler']
             if guidance:
@@ -925,6 +929,30 @@ def _record_save(original, image, *args, **kwargs):
             p = None
     records = getattr(p, '_pi_saved_files', None)
     track = records is not None and not getattr(p, '_pi_refining', False)
+    pending = getattr(p, '_pi_pending_saves', None)
+    steps = getattr(p, '_pi_image_steps', None)
+    if track and steps and pending is not None:
+        # Positions here follow Forge's public save_image signature (after image).
+        grid = args[8] if len(args) > 8 else kwargs.get('grid', False)
+        slots = getattr(p, '_pi_deferred_slots', None) or ()
+        if grid or any(slot.image is image and slot.index in steps for slot in reversed(slots)):
+            # Forge normally saves the decoded handoff estimate here. Remember
+            # this save request and give its actual final pixels to Forge once.
+            positional = list(args)
+            if (positional[14] if len(positional) > 14 else kwargs.get('save_to_dirs')) is None:
+                no_prompt = positional[7] if len(positional) > 7 else kwargs.get('no_prompt')
+                save_to_dirs = bool(shared.opts.data.get(
+                    'grid_save_to_dirs' if grid else 'save_to_dirs', False)
+                    and (grid or not no_prompt))
+                if len(positional) > 14:
+                    positional[14] = save_to_dirs
+                else:
+                    kwargs['save_to_dirs'] = save_to_dirs
+            indices = {k: getattr(p, k) for k in ('iteration', 'batch_index') if hasattr(p, k)}
+            pending.setdefault(id(image), []).append((original, positional, kwargs, indices))
+            if grid:
+                p._pi_saved_grids.append((id(image), positional[5] if len(positional) > 5 else kwargs.get('info')))
+            return None, None
     writes = [] if track and getattr(shared.opts, 'export_for_4chan', False) else None
     token = _export_writes.set(writes)
     try:
@@ -945,8 +973,28 @@ def _record_save(original, image, *args, **kwargs):
     return result
 
 
+def _save_finished(p, identity, image, info):
+    pending = (getattr(p, '_pi_pending_saves', None) or {}).pop(identity, [])
+    for original, positional, kwargs, indices in pending:
+        old = {k: getattr(p, k) for k in indices}
+        try:
+            for k, value in indices.items():
+                setattr(p, k, value)
+            if len(positional) > 5:
+                positional[5] = info
+            else:
+                kwargs['info'] = info
+            original(image, *positional, **kwargs)
+        finally:
+            for k, value in old.items():
+                setattr(p, k, value)
+    _rewrite_saved(image, info, (getattr(p, '_pi_saved_files', None) or {}).get(identity, []))
+
+
 def _rewrite_saved(image, info, records):
     """Replace precisely the files the base pass saved; no duplicate filenames."""
+    if not records:
+        return
     import os
     import tempfile
     import shutil
@@ -1121,7 +1169,10 @@ def _finish_images(p, result):
                     failures.append(f'Image {sample_index + 1}: Image continuation did not finish')
                     continue
             final_input = pp.image
-            processor.postprocess_image_after_composite(p, pp)
+            if continuation:
+                processor.postprocess_image_after_composite(p, pp, finishing_bridge=True)
+            else:
+                processor.postprocess_image_after_composite(p, pp)
             if pp.image is final_input:
                 error = p.extra_generation_params.get('Refiner error')
                 if error:
@@ -1145,8 +1196,7 @@ def _finish_images(p, result):
             pp.image.info.update(getattr(source, 'info', {}))
             pp.image.info['parameters'] = info
             try:
-                records = getattr(p, '_pi_saved_files', {}).get(id(source), [])
-                _rewrite_saved(pp.image, info, records)
+                _save_finished(p, id(source), pp.image, info)
             except Exception as exc:
                 p.extra_generation_params['Refiner error'] = 'Saving refined image failed: ' + str(exc)
                 failures.append(f'Image {sample_index + 1}: saving refined image failed: {exc}')
@@ -1178,7 +1228,9 @@ def _finish_images(p, result):
                         continue
                     seen_grids.add(identity)
                     saved_info = (original_info if original_info is not None else grid_info_original) or ''
-                    _rewrite_saved(grid, saved_info + ', ' + details, getattr(p, '_pi_saved_files', {}).get(identity, []))
+                    if identity in (getattr(p, '_pi_pending_saves', None) or {}) and completed != len(slots):
+                        continue
+                    _save_finished(p, identity, grid, saved_info + ', ' + details)
             except Exception as exc:
                 grid_failed = True
                 failures.append(f'Grid: saving refined grid failed: {exc}')
@@ -1244,6 +1296,12 @@ def _ideogram_base_override(p):
             model_data.forge_loading_parameters = loading
 
 
+def _needs_donor_conditioning(p):
+    return (getattr(p, '_pi_refiner_mode', None) == _LAST_STEPS
+            and bool(p.extra_generation_params.get('Qwen Head Swap'))
+            and bool(p.extra_generation_params.get('Headshots used')))
+
+
 def _image_step_boundary(p, estimate, completed, total):
     """Transfer an image estimate only at a fixed, completed sampler step."""
     import math
@@ -1258,6 +1316,9 @@ def _image_step_boundary(p, estimate, completed, total):
     if p._pi_bridge_examined == iteration:
         return
     p._pi_bridge_examined = iteration
+    if _needs_donor_conditioning(p):
+        p.extra_generation_params['Refiner fallback'] = 'Finish the donor-guided base edit before single-image refinement'
+        return
     if (checkpoint == _DLSS_TARGET or getattr(p, 'enable_hr', False)
             or getattr(p, 'is_hr_pass', False) or getattr(p, 'image_mask', None) is not None
             or getattr(p.sd_model.forge_objects.unet, 'controlnet_linked_list', None) is not None
@@ -1336,6 +1397,9 @@ def _apply_handoff(original, denoiser, x, sigma):
     meta = p.extra_generation_params
     meta['Refiner requested mode'] = _LAST_STEPS
     meta['Refiner mode'] = _FINAL_ONLY
+    if _needs_donor_conditioning(p):
+        meta['Refiner fallback'] = 'Finish the donor-guided base edit before single-image refinement'
+        return False
     if p.sampler_name in ('Euler', 'Euler a') and hasattr(p, '_pi_image_steps'):
         _image_step_boundary(p, getattr(shared.state, 'current_latent', None), denoiser.step, total)
     if (checkpoint == _DLSS_TARGET or getattr(p, 'enable_hr', False)
@@ -1415,6 +1479,7 @@ def _dispatch(original, p, args, kwargs, runner=None):
     p._pi_refiner_output_scale = None
     p._pi_standard_callback = False
     p._pi_saved_files = {}
+    p._pi_pending_saves = {}
     p._pi_deferred_slots = []
     p._pi_saved_grids = []
     p._pi_handoff_iteration = None
@@ -1429,6 +1494,7 @@ def _dispatch(original, p, args, kwargs, runner=None):
         p._pi_refiner_can_resize_output = False
         p._pi_refiner_output_scale = None
         p._pi_saved_files = None
+        p._pi_pending_saves = None
         p._pi_deferred_slots = None
         p._pi_saved_grids = None
 

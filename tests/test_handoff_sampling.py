@@ -110,6 +110,17 @@ class HandoffSamplingTests(unittest.TestCase):
         self.host.sampling_prepare.assert_called_once_with(self.target_model.forge_objects.unet, x=self.x)
         self.original.assert_not_called()
 
+    def test_donor_guided_edit_finishes_on_the_base_for_both_handoffs(self):
+        self.p.extra_generation_params.update({'Qwen Head Swap': 'identity', 'Headshots used': 2})
+        self.p._pi_bridge_examined = None
+        self.p._pi_image_steps = {}
+        self.engine._image_step_boundary(self.p, self.x, 15, 20)
+        self.assertFalse(self.p._pi_image_steps)
+        self.assertFalse(self.apply())
+        self.assertIn('donor-guided', self.p.extra_generation_params['Refiner fallback'])
+        self.assertEqual(self.p.extra_generation_params['Refiner mode'], self.engine._FINAL_ONLY)
+        self.sd_models.forge_model_reload.assert_not_called()
+
     def test_same_checkpoint_falls_back_without_reloading(self):
         self.sd_models.get_closet_checkpoint_match.return_value = self.base
         self.assertFalse(self.apply())
