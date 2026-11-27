@@ -84,6 +84,8 @@ Compatible native SD 1.x and FLUX.1-dev pairs can switch directly during Euler s
 
 Image handoff needs a fixed step count, a sampler that exposes a denoised image estimate, and a target that can refine images for the requested number of steps. Adaptive samplers, direct base pipelines without step callbacks, fixed-recipe targets, Hires fix and ControlNet use the final pass where supported. Text-only targets cannot refine an image.
 
+The continuation starts a target-specific schedule. Generation details report both target stages’ samplers and schedulers, and Klein reference conditioning when available. Klein 9B distilled and Klein 9B Base use different recipes. [Official Klein model overview](https://github.com/black-forest-labs/flux2#model-overview). Cross-family VAE decoding and re-encoding is also illustrated in this [community FLUX to SDXL workflow](https://www.reddit.com/r/comfyui/comments/1grht45/workflow_flux_dev_with_sdxl_as_refiner/).
+
 ## Beginner installation
 
 1. Stop Forge completely.

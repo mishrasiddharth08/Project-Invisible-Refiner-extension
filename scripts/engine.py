@@ -254,6 +254,16 @@ class Script(scripts.Script):
                 'Refiner switch at': switch, 'Refiner denoising strength': strength,
                 'Refiner CFG scale': job.cfg_scale, 'Refiner steps': actual_steps})
             p.extra_generation_params['Refiner sampler'] = getattr(job,'sampler_name',_target_setting(p,'sampler',p.sampler_name))
+            p.extra_generation_params['Refiner scheduler'] = getattr(job, 'scheduler', _target_setting(p, 'scheduler', p.scheduler))
+            if profile.get('family') in ('flux2_klein4', 'flux2_klein9'):
+                reference = shared.opts.data.get('klein_do_reference')
+                if reference is None:
+                    reference = getattr(shared.opts, 'klein_do_reference', None)
+                if reference is not None:
+                    p.extra_generation_params['Refiner Klein reference conditioning'] = bool(reference)
+            if continuation_steps:
+                p.extra_generation_params['Refiner continuation sampler'] = p.extra_generation_params['Refiner sampler']
+                p.extra_generation_params['Refiner continuation scheduler'] = p.extra_generation_params['Refiner scheduler']
             if guidance:
                 p.extra_generation_params['Refiner Ideogram 4 guidance path'] = guidance
             if getattr(p, '_pi_refiner_text', None) is not None:
