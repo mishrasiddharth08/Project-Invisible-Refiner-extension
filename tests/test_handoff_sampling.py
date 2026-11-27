@@ -60,35 +60,6 @@ class HandoffSamplingTests(unittest.TestCase):
     def apply(self):
         return self.engine._apply_handoff(self.original, self.denoiser, self.x, self.sigma)
 
-    def test_pixel_handoff_uses_solver_steps_and_target_budget(self):
-        class EndBase(BaseException):
-            pass
-        self.host.InterruptedException = EndBase
-        self.p.batch_size, self.p.iteration = 2, 1
-        self.compatibility.return_value = False
-        self.engine._preflight = Mock(return_value=self.target)
-        self.engine._target_profile = Mock(return_value={'family': 'flux2_klein9', 'modules': ['vae', 'encoder']})
-        self.modules.shared.state = types.SimpleNamespace(current_latent=self.x)
-        self.denoiser.steps = 20
-        sampler = types.SimpleNamespace(p=self.p, model_wrap_cfg=self.denoiser)
-        callback = self.engine._sampler_callback(Mock())
-        with patch.dict(sys.modules, {'modules.sd_samplers_common': self.host}):
-            for name in ('Euler a', 'Heun', 'DPM++ 2M', 'DDIM'):
-                self.p.sampler_name = name
-                self.p._pi_image_steps, self.p._pi_bridge_examined = {}, None
-                self.p._pi_handoff_iteration = None
-                with self.subTest(name=name), self.assertRaises(EndBase):
-                    if name == 'Euler a':
-                        self.denoiser.step = 15
-                        self.apply()
-                    else:
-                        callback(sampler, {'i': 13, 'denoised': self.x})
-                        self.assertFalse(self.p._pi_image_steps)
-                        callback(sampler, {'i': 14, 'denoised': self.x})
-                self.assertEqual(self.p._pi_image_steps, {2: 5, 3: 5})
-                self.assertIs(self.modules.shared.state.current_latent, self.x)
-                self.assertEqual(self.p.extra_generation_params['Refiner handoff step'], 16)
-
     def test_threshold_then_success_preserves_recipe_and_target_conditioning(self):
         self.denoiser.step = 14
         self.assertFalse(self.apply())
@@ -109,17 +80,6 @@ class HandoffSamplingTests(unittest.TestCase):
         self.host.sampling_cleanup.assert_called_once_with(self.base_model.forge_objects.unet)
         self.host.sampling_prepare.assert_called_once_with(self.target_model.forge_objects.unet, x=self.x)
         self.original.assert_not_called()
-
-    def test_donor_guided_edit_finishes_on_the_base_for_both_handoffs(self):
-        self.p.extra_generation_params.update({'Qwen Head Swap': 'identity', 'Headshots used': 2})
-        self.p._pi_bridge_examined = None
-        self.p._pi_image_steps = {}
-        self.engine._image_step_boundary(self.p, self.x, 15, 20)
-        self.assertFalse(self.p._pi_image_steps)
-        self.assertFalse(self.apply())
-        self.assertIn('donor-guided', self.p.extra_generation_params['Refiner fallback'])
-        self.assertEqual(self.p.extra_generation_params['Refiner mode'], self.engine._FINAL_ONLY)
-        self.sd_models.forge_model_reload.assert_not_called()
 
     def test_same_checkpoint_falls_back_without_reloading(self):
         self.sd_models.get_closet_checkpoint_match.return_value = self.base

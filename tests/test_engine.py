@@ -48,52 +48,6 @@ class Tests(unittest.TestCase):
         self.job.close.assert_called_once()
         self.assertFalse(self.job.disable_extra_networks)
 
-    def test_donor_guided_fallback_uses_one_gentle_target_pass(self):
-        self.p._pi_refiner_mode = self.engine._LAST_STEPS
-        self.p.extra_generation_params.update({'Qwen Head Swap': 'identity', 'Headshots used': 2})
-        self.run_pass()
-        jobs = self.modules.processing.StableDiffusionProcessingImg2Img.call_args_list
-        self.assertEqual([job.kwargs['denoising_strength'] for job in jobs], [.2])
-
-    def test_image_continuation_feeds_final_pass_without_replacing_file_twice(self):
-        from PIL import Image
-        source, continued, final = [Image.new('RGB', (8, 8), color) for color in ('black', 'gray', 'white')]
-        result = self.batch_result(1)
-        result.images = [source]
-        self.p._pi_image_steps = {0: 3}
-        self.p._pi_refiner_mode = self.engine._LAST_STEPS
-        self.p._pi_refiner_steps = 7
-        self.modules.processing.process_images.side_effect = [
-            types.SimpleNamespace(images=[im], index_of_first_image=0) for im in (continued, final)]
-        self.engine._rewrite_saved = Mock()
-        self.engine._finish(self.p, result)
-        jobs = self.modules.processing.StableDiffusionProcessingImg2Img.call_args_list
-        self.assertEqual([job.kwargs['steps'] for job in jobs], [3, 7])
-        self.assertEqual([job.kwargs['denoising_strength'] for job in jobs], [.25, .2])
-        self.assertEqual([job.kwargs['init_images'][0] for job in jobs], [source, continued])
-        self.assertIs(result.images[0], final)
-        self.engine._rewrite_saved.assert_called_once()
-
-    def test_bridge_saves_only_finished_pixels_at_original_batch_index(self):
-        from PIL import Image
-        early = Image.new('RGB', (8, 8), 'gray')
-        final = Image.new('RGB', (8, 8), 'white')
-        self.p._pi_saved_files, self.p._pi_pending_saves = {}, {}
-        self.p._pi_deferred_slots = [types.SimpleNamespace(image=early, index=2)]
-        self.p._pi_image_steps = {2: 4}
-        self.p.iteration, self.p.batch_index = 2, 0
-        seen = []
-        def save(image, path, basename, seed=None, prompt=None, extension='png', info=None, p=None, save_to_dirs=None):
-            seen.append((image, info, p.iteration, save_to_dirs))
-            return 'final.png', None
-        self.engine._record_save(save, early, 'out', '', info='handoff', p=self.p)
-        self.assertFalse(seen)
-        self.p.iteration = 5
-        self.engine._save_finished(self.p, id(early), final, 'completed')
-        self.assertEqual(seen, [(final, 'completed', 2, False)])
-        self.assertEqual(self.p.iteration, 5)
-        self.assertFalse(self.p._pi_pending_saves)
-
     def test_failure_restores_and_retains_image(self):
         self.modules.processing.process_images.side_effect = RuntimeError('unsupported image input')
         self.run_pass()
@@ -323,31 +277,20 @@ class Tests(unittest.TestCase):
         self.assertIs(result.images[0], original)
         self.engine._rewrite_saved.assert_not_called()
 
-    def test_both_modes_replace_saved_png_even_with_legacy_comparison_enabled(self):
+    def test_before_refiner_preserves_base_and_avoids_collisions(self):
+        from PIL import Image
         import tempfile
-        from PIL import Image, PngImagePlugin
-
-        def save(image, info, filename, **kwargs):
-            metadata = PngImagePlugin.PngInfo()
-            metadata.add_text('parameters', info)
-            image.save(filename, pnginfo=metadata)
-
-        self.modules.images = types.SimpleNamespace(save_image_with_geninfo=save)
-        for mode in (self.engine._FINAL_ONLY, self.engine._LAST_STEPS):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
-                self.engine._setup(None, self.p, True, 'target', .75, 1, keep_before=True, mode=mode)
-                target = Path(folder) / 'sample.png'
-                source = Image.new('RGB', (8, 8), 'black')
-                source.save(target)
-                result = types.SimpleNamespace(images=[source], info='base', infotexts=['base'])
-                self.p._pi_saved_files = {id(source): [(str(target), None)]}
-                self.modules.processing.process_images.return_value.images = [Image.new('RGB', (8, 8), 'white')]
-                self.engine._finish(self.p, result)
-                self.assertEqual(list(Path(folder).iterdir()), [target])
-                with Image.open(target) as final:
-                    self.assertEqual(final.getpixel((0, 0)), (255, 255, 255))
-                    self.assertIn('Refiner: target', final.info['parameters'])
-                    self.assertEqual(final.tobytes(), result.images[0].tobytes())
+        with tempfile.TemporaryDirectory() as folder:
+            original = Path(folder)/'sample.png'
+            Image.new('RGB', (8, 8), 'black').save(original)
+            before = original.read_bytes()
+            kept = self.engine._keep_before_image(original)
+            second = self.engine._keep_before_image(original)
+            self.assertNotEqual(kept, second)
+            self.modules.images = types.SimpleNamespace(save_image_with_geninfo=lambda image,info,name,**kw:image.save(name))
+            self.engine._rewrite_saved(Image.new('RGB', (8, 8), 'white'), '', [(str(original),None)])
+            self.assertEqual(kept.read_bytes(), before)
+            self.assertNotEqual(original.read_bytes(), before)
 
     def test_export_collision_tracks_exact_jpg_and_rewrites_at_saved_size(self):
         import tempfile, os
