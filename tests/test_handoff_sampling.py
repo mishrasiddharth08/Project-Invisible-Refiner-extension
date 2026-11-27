@@ -60,6 +60,35 @@ class HandoffSamplingTests(unittest.TestCase):
     def apply(self):
         return self.engine._apply_handoff(self.original, self.denoiser, self.x, self.sigma)
 
+    def test_pixel_handoff_uses_solver_steps_and_target_budget(self):
+        class EndBase(BaseException):
+            pass
+        self.host.InterruptedException = EndBase
+        self.p.batch_size, self.p.iteration = 2, 1
+        self.compatibility.return_value = False
+        self.engine._preflight = Mock(return_value=self.target)
+        self.engine._target_profile = Mock(return_value={'family': 'flux2_klein9', 'modules': ['vae', 'encoder']})
+        self.modules.shared.state = types.SimpleNamespace(current_latent=self.x)
+        self.denoiser.steps = 20
+        sampler = types.SimpleNamespace(p=self.p, model_wrap_cfg=self.denoiser)
+        callback = self.engine._sampler_callback(Mock())
+        with patch.dict(sys.modules, {'modules.sd_samplers_common': self.host}):
+            for name in ('Euler a', 'Heun', 'DPM++ 2M', 'DDIM'):
+                self.p.sampler_name = name
+                self.p._pi_image_steps, self.p._pi_bridge_examined = {}, None
+                self.p._pi_handoff_iteration = None
+                with self.subTest(name=name), self.assertRaises(EndBase):
+                    if name == 'Euler a':
+                        self.denoiser.step = 15
+                        self.apply()
+                    else:
+                        callback(sampler, {'i': 13, 'denoised': self.x})
+                        self.assertFalse(self.p._pi_image_steps)
+                        callback(sampler, {'i': 14, 'denoised': self.x})
+                self.assertEqual(self.p._pi_image_steps, {2: 5, 3: 5})
+                self.assertIs(self.modules.shared.state.current_latent, self.x)
+                self.assertEqual(self.p.extra_generation_params['Refiner handoff step'], 16)
+
     def test_threshold_then_success_preserves_recipe_and_target_conditioning(self):
         self.denoiser.step = 14
         self.assertFalse(self.apply())

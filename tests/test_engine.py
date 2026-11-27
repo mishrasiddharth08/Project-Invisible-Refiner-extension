@@ -48,6 +48,24 @@ class Tests(unittest.TestCase):
         self.job.close.assert_called_once()
         self.assertFalse(self.job.disable_extra_networks)
 
+    def test_image_continuation_feeds_final_pass_without_replacing_file_twice(self):
+        from PIL import Image
+        source, continued, final = [Image.new('RGB', (8, 8), color) for color in ('black', 'gray', 'white')]
+        result = self.batch_result(1)
+        result.images = [source]
+        self.p._pi_image_steps = {0: 3}
+        self.p._pi_refiner_mode = self.engine._LAST_STEPS
+        self.p._pi_refiner_steps = 7
+        self.modules.processing.process_images.side_effect = [
+            types.SimpleNamespace(images=[im], index_of_first_image=0) for im in (continued, final)]
+        self.engine._rewrite_saved = Mock()
+        self.engine._finish(self.p, result)
+        jobs = self.modules.processing.StableDiffusionProcessingImg2Img.call_args_list
+        self.assertEqual([job.kwargs['steps'] for job in jobs], [3, 7])
+        self.assertEqual([job.kwargs['init_images'][0] for job in jobs], [source, continued])
+        self.assertIs(result.images[0], final)
+        self.engine._rewrite_saved.assert_called_once()
+
     def test_failure_restores_and_retains_image(self):
         self.modules.processing.process_images.side_effect = RuntimeError('unsupported image input')
         self.run_pass()

@@ -16,7 +16,7 @@ Choose **Refiner only** (default) for a separate image-to-image pass. Choose **L
 Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, are forwarded. The LoRA rules textbox and explanatory panel are removed; user LoRAs stay on the base checkpoint. Both target stages use clean weights.
 
 ## Testing status
-28 Nov 2026: 160 automated tests passed. An RTX 5090 img2img run at 1664×2048 used Qwen 2.1 Turbo INT8 ConvRot with two base LoRAs and Euler a. **Last steps + refiner** fell back to **Refiner only**. FLUX.2 Klein 9B INT8 ConvRot completed five steps and the output was saved. Compatible latent switching was covered by automated sampler tests; this GPU run exercised the fallback.
+28 Nov 2026: An RTX 5090 img2img test at 1536×2048 used Qwen 2.1 Turbo INT8 ConvRot with two base LoRAs, Euler a and SGM Uniform. Qwen ran five of ten steps. FLUX.2 Klein 9B INT8 ConvRot received the decoded intermediate image, ran five continuation steps and then six final refinement steps. Automated tests also exercise other native sampler callbacks.
 
 10 Nov 2026: 125 automated tests passed. On an RTX 5090, fixed-seed 512×512 generations
 verified MOSS Image SFT INT8 ConvRot as base and as its own Refiner, and
@@ -80,7 +80,9 @@ Refinement can change text, faces, and details. Metadata records the target, str
 5. Press **Generate**. Check generation parameters and the terminal for errors.
 6. Both modes replace the PNG saved by the base pass with the refined pixels and generation details. The filename stays the same.
 
-The last-step option checks native SD 1.x and FLUX.1-dev checkpoint headers and uses the existing base encoders and VAE for sampling. Use distinct compatible floating-point safetensors and native Euler with Hires fix and ControlNet off. Other combinations, including Qwen 2.1 to FLUX.2 Klein, use the final image pass only. Generation details record the actual mode, handoff step or fallback reason.
+Compatible native SD 1.x and FLUX.1-dev pairs can switch directly during Euler sampling. For supported cross-family pairs, Forge decodes the intermediate prediction at **Switch at**. The target encodes that image using its own VAE, runs the remaining step budget with its img2img settings, then runs the final refinement pass. The base scheduler determines the intermediate prediction. Generation details record the handoff step, continuation steps and final steps separately.
+
+Image handoff needs a fixed step count, a sampler that exposes a denoised image estimate, and a target that can refine images for the requested number of steps. Adaptive samplers, direct base pipelines without step callbacks, fixed-recipe targets, Hires fix and ControlNet use the final pass where supported. Text-only targets cannot refine an image.
 
 ## Beginner installation
 

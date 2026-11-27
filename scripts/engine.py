@@ -134,7 +134,7 @@ class Script(scripts.Script):
     def ui(self, is_img2img):
         return []
 
-    def postprocess_image_after_composite(self, p, pp, *args):
+    def postprocess_image_after_composite(self, p, pp, *args, continuation_steps=0):
         # Finish the base batch before changing models. This avoids reloading
         # both models for every image, and never switches during a live sampler.
         if getattr(p, '_pi_dispatching', False) and not getattr(p, '_pi_external_finish', False):
@@ -204,7 +204,7 @@ class Script(scripts.Script):
                 prompt=_prompt(positive),
                 negative_prompt='' if omit_negative else negative,
                 seed=_value(p, 'all_seeds', i, p.seed), subseed=_value(p, 'all_subseeds', i, p.subseed),
-                subseed_strength=p.subseed_strength, steps=_fast_steps(p, strength), denoising_strength=strength,
+                subseed_strength=p.subseed_strength, steps=continuation_steps or _fast_steps(p, strength), denoising_strength=strength,
                 cfg_scale=target_cfg,
                 image_cfg_scale=getattr(p, 'image_cfg_scale', None),
                 distilled_cfg_scale=_target_setting(p, 'dcfg', p.distilled_cfg_scale),
@@ -1023,8 +1023,7 @@ def _finish(p, result):
     try:
         if getattr(p, '_pi_refiner_mode', _FINAL_ONLY) == _LAST_STEPS:
             p.extra_generation_params['Refiner requested mode'] = _LAST_STEPS
-            p.extra_generation_params.setdefault('Refiner mode', _FINAL_ONLY)
-            if p.extra_generation_params['Refiner mode'] == _FINAL_ONLY:
+            if not getattr(p, '_pi_image_steps', None) and p.extra_generation_params.setdefault('Refiner mode', _FINAL_ONLY) == _FINAL_ONLY:
                 p.extra_generation_params.setdefault('Refiner fallback', 'No compatible sampler handoff')
         with _checkpoint_session(p, spec[0]):
             return _finish_images(p, result)
@@ -1104,12 +1103,25 @@ def _finish_images(p, result):
                 break
             source = samples[index]
             pp = SimpleNamespace(image=source, index=sample_index)
-            Script().postprocess_image_after_composite(p, pp)
-            if pp.image is source:
+            processor = Script()
+            continuation = getattr(p, '_pi_image_steps', {}).get(sample_index, 0)
+            if continuation:
+                processor.postprocess_image_after_composite(p, pp, continuation_steps=continuation)
+                if pp.image is source:
+                    failures.append(f'Image {sample_index + 1}: Image continuation did not finish')
+                    continue
+            final_input = pp.image
+            processor.postprocess_image_after_composite(p, pp)
+            if pp.image is final_input:
                 error = p.extra_generation_params.get('Refiner error')
                 if error:
                     failures.append(f'Image {sample_index + 1}: {error}')
                 continue
+            if continuation:
+                p.extra_generation_params.pop('Refiner fallback', None)
+                p.extra_generation_params['Refiner mode'] = _LAST_STEPS
+                p.extra_generation_params['Refiner handoff'] = 'Decoded intermediate image; target VAE and sampler'
+                p.extra_generation_params['Refiner continuation steps'] = continuation
             scale = getattr(p, '_pi_refiner_output_scale', None)
             if scale is not None:
                 from PIL import Image
@@ -1222,6 +1234,81 @@ def _ideogram_base_override(p):
             model_data.forge_loading_parameters = loading
 
 
+def _image_step_boundary(p, estimate, completed, total):
+    """Transfer an image estimate only at a fixed, completed sampler step."""
+    import math
+    if (getattr(p, '_pi_refiner_mode', None) != _LAST_STEPS
+            or not getattr(p, '_pi_dispatching', False) or getattr(p, '_pi_refining', False)
+            or not getattr(p, '_pi_refiner', None) or estimate is None or total < 2):
+        return
+    checkpoint, switch, _ = p._pi_refiner
+    if switch >= 1 or completed != max(1, min(total - 1, math.ceil(total * switch))):
+        return
+    iteration = getattr(p, 'iteration', 0)
+    if p._pi_bridge_examined == iteration:
+        return
+    p._pi_bridge_examined = iteration
+    if (checkpoint == _DLSS_TARGET or getattr(p, 'enable_hr', False)
+            or getattr(p, 'is_hr_pass', False) or getattr(p, 'image_mask', None) is not None
+            or getattr(p.sd_model.forge_objects.unet, 'controlnet_linked_list', None) is not None
+            or getattr(p.sd_model, 'is_wan', False) or 'adaptive' in p.sampler_name.lower()):
+        return
+    target = sd_models.get_closet_checkpoint_match(checkpoint)
+    if target is None:
+        return
+    # Preserve the original direct latent continuation for matching Euler engines.
+    if p.sampler_name == 'Euler' and _refiner_helper('refiner_handoff').handoff_compatible(
+            p.sd_model.sd_checkpoint_info, target, p.sd_model) and p.sd_model.sd_checkpoint_info != target:
+        return
+    try:
+        _preflight(checkpoint, p)
+        profile = _target_profile(checkpoint, target)
+        if profile.get('external') or profile.get('family') == 'fibo2':
+            return
+        family = profile.get('family')
+        if not family:
+            import sys
+            resolver = getattr(sys.modules.get('model_autolink.integration'), '_resolver', None)
+            if resolver is not None:
+                _, match = resolver.checkpoint(target.filename)
+                family = getattr(match, 'label', None)
+        architecture = str((getattr(target, 'metadata', None) or {}).get('modelspec.architecture', '')).lower()
+        native_image = family in {'flux1', 'flux2_dev', 'flux2_klein4', 'flux2_klein9', 'qwen_image',
+                                  'qwen_image21', 'moss_image', 'krea2', 'z_image'}
+        native_image |= architecture in {'stable-diffusion-v1', 'stable-diffusion-v2-512',
+                                         'stable-diffusion-v2-768-v', 'stable-diffusion-xl-v1-base'}
+        if not (native_image or getattr(target, 'refiner_supports_step_budget', False)) and not _refiner_helper('refiner_handoff').handoff_compatible(
+                p.sd_model.sd_checkpoint_info, target, p.sd_model):
+            return
+    except (OSError, ValueError, RuntimeError) as exc:
+        log.warning('Image handoff preflight failed: %s', exc)
+        return
+    from modules.sd_samplers_common import InterruptedException
+    first = iteration * p.batch_size
+    for slot in range(first, first + p.batch_size):
+        p._pi_image_steps[slot] = total - completed
+    p.extra_generation_params.pop('Refiner mode', None)
+    p.extra_generation_params.pop('Refiner fallback', None)
+    p.extra_generation_params['Refiner requested mode'] = _LAST_STEPS
+    p.extra_generation_params['Refiner handoff step'] = completed + 1
+    # This is the value launch_sampling returns for a planned early finish;
+    # the host still decodes it and cleans up the base sampler normally.
+    shared.state.current_latent = estimate
+    raise InterruptedException
+
+
+def _sampler_callback(original):
+    def callback(sampler, event):
+        result = original(sampler, event)
+        p = sampler.p
+        if (getattr(p, '_pi_refiner_mode', None) == _LAST_STEPS
+                and p.sampler_name not in ('Euler', 'Euler a')
+                and isinstance(event.get('i'), int)):
+            _image_step_boundary(p, event.get('denoised'), event['i'] + 1, sampler.model_wrap_cfg.steps)
+        return result
+    return callback
+
+
 def _apply_handoff(original, denoiser, x, sigma):
     p = denoiser.p
     if (getattr(p, '_pi_refiner_mode', None) != _LAST_STEPS
@@ -1239,10 +1326,12 @@ def _apply_handoff(original, denoiser, x, sigma):
     meta = p.extra_generation_params
     meta['Refiner requested mode'] = _LAST_STEPS
     meta['Refiner mode'] = _FINAL_ONLY
+    if p.sampler_name in ('Euler', 'Euler a') and hasattr(p, '_pi_image_steps'):
+        _image_step_boundary(p, getattr(shared.state, 'current_latent', None), denoiser.step, total)
     if (checkpoint == _DLSS_TARGET or getattr(p, 'enable_hr', False)
             or p.sampler_name != 'Euler' or getattr(p, 'is_hr_pass', False)
             or getattr(p.sd_model.forge_objects.unet, 'controlnet_linked_list', None) is not None):
-        meta['Refiner fallback'] = 'Requires native Euler without Hires fix or ControlNet'
+        meta['Refiner fallback'] = 'No supported image handoff; direct latent switching requires native Euler without Hires fix or ControlNet'
         return False
     base = p.sd_model.sd_checkpoint_info
     target = sd_models.get_closet_checkpoint_match(checkpoint)
@@ -1319,6 +1408,8 @@ def _dispatch(original, p, args, kwargs, runner=None):
     p._pi_deferred_slots = []
     p._pi_saved_grids = []
     p._pi_handoff_iteration = None
+    p._pi_image_steps = {}
+    p._pi_bridge_examined = None
     try:
         with _ideogram_base_override(p):
             result = original(*args, **kwargs)
@@ -1355,6 +1446,9 @@ def _install_routes(*unused):
     import sys
     from modules import images
     sampler = sys.modules.get('modules.sd_samplers_common')
+    sampler_class = getattr(sampler, 'Sampler', None)
+    if sampler_class is not None and hasattr(sampler_class, 'callback_state'):
+        _patch(sampler_class, 'callback_state', _sampler_callback)
     if sampler is not None and hasattr(sampler, 'apply_refiner'):
         _patch(sampler, 'apply_refiner', lambda original:
                lambda denoiser, x, sigma: _apply_handoff(original, denoiser, x, sigma))
