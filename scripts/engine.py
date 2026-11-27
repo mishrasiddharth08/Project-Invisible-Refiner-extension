@@ -12,6 +12,8 @@ _wrappers = []
 _enabled = True
 _lifecycle_token = object()
 _DLSS_TARGET = 'DLSS 5 Neural Rendering'
+_FINAL_ONLY = 'Refiner only'
+_LAST_STEPS = 'Last steps + refiner'
 _export_writes = ContextVar('pi_refiner_export_writes', default=None)
 _save_observer = None
 
@@ -58,7 +60,7 @@ def _checkpoint_choices(choices):
 
 
 def _setup(self, p, enabled, checkpoint, switch, cfg, replacements='', separate_prompt=False,
-           target_prompt='', target_negative='', target_steps=0, keep_before=False, *args, **kwargs):
+           target_prompt='', target_negative='', target_steps=0, keep_before=False, mode=_FINAL_ONLY, *args, **kwargs):
     # No persistent option writes or hidden LoRA substitution rules.
     p._pi_refiner = (checkpoint, float(switch), cfg) if enabled and checkpoint not in (None, '', 'None') else None
     p.refiner_checkpoint = p.refiner_switch_at = p.refiner_checkpoint_info = None
@@ -66,6 +68,7 @@ def _setup(self, p, enabled, checkpoint, switch, cfg, replacements='', separate_
     p._pi_refiner_text = (str(target_prompt), str(target_negative)) if separate_prompt else None
     p._pi_refiner_steps = target_steps
     p._pi_keep_before = bool(keep_before)
+    p._pi_refiner_mode = _LAST_STEPS if mode == _LAST_STEPS else _FINAL_ONLY
 
 
 def _ui(self, is_img2img):
@@ -80,6 +83,8 @@ def _ui(self, is_img2img):
                                      elem_id=self.elem_id('checkpoint'))
             create_refresh_button(checkpoint, self.refresh_checkpoints,
                                   lambda: {'choices': _checkpoint_choices(self.ckpts)}, self.elem_id('checkpoint_refresh'))
+        mode = gr.Dropdown(value=_FINAL_ONLY, choices=[_FINAL_ONLY, _LAST_STEPS], label='Mode',
+                           elem_id=self.elem_id('mode'), info='Last steps uses the target during compatible sampling, then refines the image. LoRAs stay on the base.')
         with gr.Row():
             switch = gr.Slider(value=.75, minimum=0, maximum=1, step=.025,
                                label='Switch at', elem_id=self.elem_id('switch_at'),
@@ -93,7 +98,7 @@ def _ui(self, is_img2img):
         with gr.Accordion('Refiner target settings', open=False):
             gr.Markdown('FLUX3 distilled requires CFG1; experimental Base accepts CFG0..20. Both require an empty target negative. AutoNeg can stay enabled for the base stage: explicitly enable separate refiner prompts and leave the target negative empty. FLUX3 does not gain negative-prompt support from this separation.')
             separate = gr.Checkbox(value=False, label='Use separate refiner prompts',
-                info='Explicit target prompts leave base prompts unchanged. An empty target negative clears only the refiner negative. Remove foreign base-model LoRA tags here; they are never silently removed.')
+                info='Use a separate prompt for the final image pass. Your LoRAs apply only to the base stage.')
             target_prompt = gr.Textbox(value='', label='Refiner positive prompt', lines=3)
             target_negative = gr.Textbox(value='', label='Refiner negative prompt', lines=2)
             target_steps = gr.Slider(value=0, minimum=0, maximum=100, step=1,
@@ -106,8 +111,9 @@ def _ui(self, is_img2img):
         PasteField(separate, lambda d: d.get('Refiner separate prompts') == 'True'),
         PasteField(target_prompt, lambda d: d.get('Refiner positive prompt', '')),
         PasteField(target_negative, lambda d: d.get('Refiner negative prompt', '')),
-        PasteField(target_steps, lambda d: int(d.get('Refiner requested steps', 0)))]
-    return [enabled, checkpoint, switch, cfg, replacements, separate, target_prompt, target_negative, target_steps, keep_before]
+        PasteField(target_steps, lambda d: int(d.get('Refiner requested steps', 0))),
+        PasteField(mode, lambda d: d.get('Refiner requested mode', _FINAL_ONLY))]
+    return [enabled, checkpoint, switch, cfg, replacements, separate, target_prompt, target_negative, target_steps, keep_before, mode]
 
 
 def _value(p, name, index, fallback):
@@ -187,6 +193,7 @@ class Script(scripts.Script):
             profile = getattr(p, '_pi_target_profile', None) or {}
             positive, negative = _target_text(p, i)
             positive, omitted_tags = _target_positive(p, positive, profile)
+            negative = _refiner_helper('refiner_lora').strip_tags(negative)
             omit_negative = profile.get('family') in ('flux3', 'ideogram4') and getattr(p, '_pi_refiner_text', None) is None
             target_cfg = _target_cfg(p, cfg)
             guidance = None
@@ -219,7 +226,7 @@ class Script(scripts.Script):
             job._pi_refining = True
             job.scripts = _OptionsOnlyRunner(getattr(p, 'scripts', None))
             job.script_args = getattr(p, 'script_args', ())
-            job.disable_extra_networks = getattr(p, 'disable_extra_networks', False)
+            job.disable_extra_networks = False
             if profile.get('family') == 'fibo2':
                 # Let the owning engine validate its exact recipe; no host edits.
                 import sys
@@ -228,7 +235,8 @@ class Script(scripts.Script):
             if profile.get('family') == 'moss_image':
                 _refiner_helper('moss_refiner').configure_job(job, profile)
             generate = profile.get('generate')
-            output = generate(job) if generate is not None else processing.process_images(job)
+            with _refiner_helper('refiner_lora').final_pass(p, job, shared, sd_models):
+                output = generate(job) if generate is not None else processing.process_images(job)
             if shared.state.interrupted or shared.state.skipped or getattr(shared.state, 'stopping_generation', False):
                 return
             first = getattr(output, 'index_of_first_image', 0)
@@ -257,8 +265,7 @@ class Script(scripts.Script):
                 p.extra_generation_params['Refiner negative policy'] = 'explicit target negative; base/AutoNeg unchanged'
             elif omit_negative and str(negative or '').strip():
                 p.extra_generation_params['Refiner negative policy'] = 'unsupported by target; base negative preserved'
-            if omitted_tags:
-                p.extra_generation_params['Refiner adapter policy'] = 'target does not support adapters; base tags preserved'
+            p.extra_generation_params['Refiner adapter policy'] = 'User LoRAs on base only'
             p.extra_generation_params['Refiner requested steps'] = getattr(p, '_pi_refiner_steps', 0)
             for key, value in extra.items():
                 if key.startswith(('Ideogram 4 refiner', 'FIBO ', 'MOSS ')):
@@ -325,11 +332,11 @@ def _unload():
 
 script_callbacks.on_script_unloaded(_unload)
 
-def _release_for_switch(checkpoint):
+def _release_for_switch(checkpoint, force=False):
     """Release loaded external engines; native engines stay Forge-managed."""
     import sys
     current = shared.opts.data.get('sd_model_checkpoint')
-    if sd_models.get_closet_checkpoint_match(current) == sd_models.get_closet_checkpoint_match(checkpoint):
+    if not force and sd_models.get_closet_checkpoint_match(current) == sd_models.get_closet_checkpoint_match(checkpoint):
         return
     for name, method in (('pi_qwen21.lib.runtime', 'release'),
                          ('pi_boogu_image.lib.pipeline', 'release'),
@@ -345,7 +352,7 @@ def _release_for_switch(checkpoint):
     lifecycle = sys.modules.get('pi_ideogram_forge.lifecycle')
     cache = getattr(ideogram, '_PIPELINE_CACHE', None)
     if cache and lifecycle is not None:
-        lifecycle.release_changed(cache, checkpoint)
+        lifecycle.release_changed(cache, object() if force else checkpoint)
 
 
 def _unload_native(p):
@@ -459,23 +466,28 @@ def _preflight(checkpoint, p=None):
 
 
 def _target_text(p, index=None):
+    strip = _refiner_helper('refiner_lora').strip_tags
     explicit = getattr(p, '_pi_refiner_text', None)
     if explicit is not None:
-        if not explicit[0].strip(): raise ValueError('Explicit refiner positive prompt is empty.')
-        return explicit
+        clean = tuple(strip(value) for value in explicit)
+        if not clean[0].strip(): raise ValueError('Explicit refiner positive prompt is empty.')
+        return clean
     if index is None:
-        return (getattr(p,'all_prompts',None) or p.prompt,
-                getattr(p,'all_negative_prompts',None) or p.negative_prompt)
-    return (_value(p,'all_prompts',index,p.prompt),
-            _value(p,'all_negative_prompts',index,p.negative_prompt))
+        return (strip(getattr(p,'all_prompts',None) or p.prompt),
+                strip(getattr(p,'all_negative_prompts',None) or p.negative_prompt))
+    return (strip(_value(p,'all_prompts',index,p.prompt)),
+            strip(_value(p,'all_negative_prompts',index,p.negative_prompt)))
 
 
 def _target_positive(p, positive, profile):
+    clean = _refiner_helper('refiner_lora').strip_tags(positive)
+    omitted = clean != positive
+    positive = clean
     if profile.get('comfy_profile') and getattr(p, '_pi_refiner_text', None) is None:
         from modules import extra_networks
         clean, tags = extra_networks.parse_prompt(positive)
-        return clean, bool(tags)
-    return positive, False
+        return clean, omitted or bool(tags)
+    return positive, omitted
 
 
 def _flux3_target(checkpoint, info):
@@ -738,12 +750,15 @@ def _checkpoint_session(p, checkpoint):
     online_lora = getattr(dynamic, 'online_lora', None)
     restore_keys = set()
     try:
+        # FINAL must not reuse a cached external pipeline carrying base LoRAs,
+        # including when the target checkpoint is the same. Once per batch.
+        _release_for_switch(checkpoint, force=True)
         if switched:
             if getattr(p, '_pi_external_finish', False):
                 _release_base_conditioning(p)
-            _release_for_switch(checkpoint)
             try:
-                _unload_native(p)
+                if getattr(getattr(model_data, 'sd_model', None), 'sd_checkpoint_info', None) != target:
+                    _unload_native(p)
                 # Packed target weights must not inherit the source model's
                 # forced FP8/FP16 storage conversion setting.
                 shared.opts.data['forge_unet_storage_dtype'] = 'Automatic'
@@ -1035,6 +1050,11 @@ def _finish(p, result):
         return result
     p._pi_external_finish = True
     try:
+        if getattr(p, '_pi_refiner_mode', _FINAL_ONLY) == _LAST_STEPS:
+            p.extra_generation_params['Refiner requested mode'] = _LAST_STEPS
+            p.extra_generation_params.setdefault('Refiner mode', _FINAL_ONLY)
+            if p.extra_generation_params['Refiner mode'] == _FINAL_ONLY:
+                p.extra_generation_params.setdefault('Refiner fallback', 'No compatible sampler handoff')
         with _checkpoint_session(p, spec[0]):
             return _finish_images(p, result)
     except Exception as exc:
@@ -1236,6 +1256,89 @@ def _ideogram_base_override(p):
             model_data.forge_loading_parameters = loading
 
 
+def _apply_handoff(original, denoiser, x, sigma):
+    p = denoiser.p
+    if (getattr(p, '_pi_refiner_mode', None) != _LAST_STEPS
+            or not getattr(p, '_pi_dispatching', False) or getattr(p, '_pi_refining', False)
+            or not getattr(p, '_pi_refiner', None)):
+        return original(denoiser, x, sigma)
+    import math
+    checkpoint, switch, cfg = p._pi_refiner
+    total = denoiser.total_steps
+    iteration = getattr(p, 'iteration', 0)
+    if (switch >= 1 or total < 2 or p._pi_handoff_iteration == iteration
+            or denoiser.step < max(1, min(total - 1, math.ceil(total * switch)))):
+        return False
+    p._pi_handoff_iteration = iteration
+    meta = p.extra_generation_params
+    meta['Refiner requested mode'] = _LAST_STEPS
+    meta['Refiner mode'] = _FINAL_ONLY
+    if (checkpoint == _DLSS_TARGET or getattr(p, 'enable_hr', False)
+            or p.sampler_name != 'Euler' or getattr(p, 'is_hr_pass', False)
+            or getattr(p.sd_model.forge_objects.unet, 'controlnet_linked_list', None) is not None):
+        meta['Refiner fallback'] = 'Requires native Euler without Hires fix or ControlNet'
+        return False
+    base = p.sd_model.sd_checkpoint_info
+    target = sd_models.get_closet_checkpoint_match(checkpoint)
+    if base == target:
+        meta['Refiner fallback'] = 'Same checkpoint selected'
+        return False
+    if not _refiner_helper('refiner_handoff').handoff_compatible(base, target, p.sd_model):
+        meta['Refiner fallback'] = 'Checkpoint pair has no verified latent handoff'
+        return False
+    from modules import sd_samplers_common as host, extra_networks
+    loading = sd_models.model_data.forge_loading_parameters
+    if loading.get('checkpoint_info') != base:
+        meta['Refiner fallback'] = 'Base loader changed during generation'
+        return False
+
+    # Keep Forge's current sigma schedule and auxiliary encoders/VAE. A fresh
+    # engine gives the target clean weights even if the base UNet/CLIP used LoRAs.
+    original_cfg, network_data = p.cfg_scale, p.extra_network_data
+    target_cfg = cfg if cfg and cfg >= 1 else 1.0
+    old_hash = shared.opts.data.get('sd_checkpoint_hash')
+    host.sampling_cleanup(p.sd_model.forge_objects.unet)
+    denoiser.model_wrap = None
+    try:
+        sd_models.model_data.forge_loading_parameters = dict(loading, checkpoint_info=target, unet_storage_dtype=None)
+        sd_models.forge_model_reload()
+        p.cfg_scale, p.extra_network_data = target_cfg, {}
+        p.clear_prompt_cache()
+        p.setup_conds()
+        denoiser.update_inner_model()
+        host.sampling_prepare(p.sd_model.forge_objects.unet, x=x)
+    except Exception as exc:
+        # The target may have partially loaded. Restore base conditioning and
+        # its actual LoRA set before allowing another base sampler evaluation.
+        log.exception('Last-step handoff failed; restoring the base sampler')
+        sd_models.model_data.forge_loading_parameters = loading
+        sd_models.forge_model_reload()
+        p.cfg_scale, p.extra_network_data = original_cfg, network_data
+        if not p.disable_extra_networks:
+            extra_networks.activate(p, network_data)
+            p.sd_model.forge_objects = p.sd_model.forge_objects_after_applying_lora.shallow_copy()
+        p.clear_prompt_cache()
+        p.setup_conds()
+        denoiser.update_inner_model()
+        host.sampling_prepare(p.sd_model.forge_objects.unet, x=x)
+        meta['Refiner fallback'] = 'Could not switch: ' + str(exc)
+        return False
+    finally:
+        # Keep the loaded target for the remaining evaluations. Forge uses this
+        # restored recipe when it starts the next batch or a new base job.
+        sd_models.model_data.forge_loading_parameters = loading
+        p.cfg_scale, p.extra_network_data = original_cfg, network_data
+        if old_hash is None:
+            shared.opts.data.pop('sd_checkpoint_hash', None)
+        else:
+            shared.opts.data['sd_checkpoint_hash'] = old_hash
+    p.refiner_cfg = target_cfg
+    meta.pop('Refiner fallback', None)
+    meta['Refiner mode'] = _LAST_STEPS
+    meta['Refiner handoff step'] = denoiser.step + 1
+    return True
+
+
 def _dispatch(original, p, args, kwargs, runner=None):
     if getattr(p, '_pi_refining', False) or getattr(p, '_pi_dispatching', False):
         return original(*args, **kwargs)
@@ -1249,6 +1352,7 @@ def _dispatch(original, p, args, kwargs, runner=None):
     p._pi_saved_files = {}
     p._pi_deferred_slots = []
     p._pi_saved_grids = []
+    p._pi_handoff_iteration = None
     try:
         with _ideogram_base_override(p):
             result = original(*args, **kwargs)
@@ -1284,6 +1388,10 @@ def _install_routes(*unused):
     global _save_observer
     import sys
     from modules import images
+    sampler = sys.modules.get('modules.sd_samplers_common')
+    if sampler is not None and hasattr(sampler, 'apply_refiner'):
+        _patch(sampler, 'apply_refiner', lambda original:
+               lambda denoiser, x, sigma: _apply_handoff(original, denoiser, x, sigma))
     if _save_observer is None and hasattr(images, 'os'):
         observer = _ImageSaveOS(images.os)
         images.os = observer
@@ -1300,4 +1408,14 @@ def _install_routes(*unused):
     print('[PI-Refiner] Native controls and direct-pipeline refinement installed.')
 
 
+def _before_runner_init(original):
+    def initialize(runner, *args, **kwargs):
+        # API-only Forge builds its component argument ranges before before_ui.
+        _install()
+        return original(runner, *args, **kwargs)
+    return initialize
+
+
+if hasattr(getattr(scripts, 'ScriptRunner', None), 'initialize_scripts'):
+    _patch(scripts.ScriptRunner, 'initialize_scripts', _before_runner_init)
 script_callbacks.on_app_started(_install_routes)

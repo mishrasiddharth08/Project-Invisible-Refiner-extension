@@ -12,10 +12,10 @@
 A decoded-image second pass using Forge Neo's **existing Refiner** controls. Checkpoint refinement reuses Forge dependencies. Optional DLSS enhancement requires a separately supplied external runtime; no Forge core edits are required.
 
 ## Project overview
-The extension replaces the native mid-sampling latent switch with a separate image-to-image pass. This allows different model families to exchange pixels where both Forge loading and the receiving model's image input are supported.
+Choose **Refiner only** (default) for a separate image-to-image pass. Choose **Last steps + refiner** to let a compatible target finish base sampling and then refine the resulting image. This allows different model families to exchange pixels where both Forge loading and the receiving model's image input are supported.
 
 ## The Project Invisible philosophy
-Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, are forwarded. The LoRA rules textbox and explanatory panel are removed; prompt LoRAs are left unchanged. Use LoRAs compatible with the receiving model.
+Use the ordinary checkpoint/preset UI, Refiner accordion, Generate button, gallery, and saving workflow. Existing sampler, scheduler, CFG, distilled guidance, prompts, per-image seeds, are forwarded. The LoRA rules textbox and explanatory panel are removed; user LoRAs stay on the base checkpoint. Both target stages use clean weights.
 
 ## Testing status
 For this publication, all 100 CPU regression tests passed, including existing DLSS coverage and the new model routing/lifecycle checks. These tests do not establish real-weight GPU compatibility.
@@ -48,7 +48,7 @@ The receiving checkpoint must support image-to-image in the installed Forge inte
 Both stock Forge and direct pipelines finish the base batch before refinement. The target is selected once for the batch, then images are refined sequentially. Images and sidecars are staged together, with hard-link backups (copy fallback) and rollback on write failures. Gallery entries update only after saving succeeds. Returned masks/composites are excluded from refinement and rebuilt image grids. Grid metadata keeps its original text. If interrupted before refinement, original images remain. No dependence on PNG metadata. Each batch image keeps its own prompt and seed, including seed zero. Errors retain the original image and include a diagnostic message.
 
 ## Memory management
-Forge owns loading, quantization, and offloading. The extension does not convert or dequantize weights or keep another model cache. Same-checkpoint refinement avoids selection/reload calls. Different checkpoints use one target selection per batch; the base model loads on demand for the next generation. Completed base conditioning, sampler, and latent references are released before cross-model refinement; same-model prompt caches are retained. Loaded Qwen, Boogu, SenseNova, H3, Hunyuan, Flux 3 and Ideogram external engines are released through their own cleanup functions when switching. Completed cross-model handoffs unload native weights too, preventing the source and target model graphs from staying resident together. Completed latent, hires conditioning, and duplicate pixel references are released. Same-model refinement retains its model and prompt cache. Selection changes, per-family module settings, preset keys, and loader parameters are restored after success or failure. Peak memory and speed still depend on the backend, model, resolution, and hardware.
+Forge owns loading, quantization, and offloading. The extension does not convert or dequantize weights or keep another model cache. Same-checkpoint refinement avoids selection/reload calls. Different checkpoints use one target selection per batch; the base model loads on demand for the next generation. Completed base conditioning, sampler, and latent references are released before cross-model refinement. Loaded Qwen, Boogu, SenseNova, H3, Hunyuan, Flux 3 and Ideogram external engines are released through their own cleanup functions when switching. Completed cross-model handoffs unload native weights too, preventing the source and target model graphs from staying resident together. Completed latent, hires conditioning, and duplicate pixel references are released. The refiner clears cached LoRA conditioning before generating. Selection changes, per-family module settings, preset keys, and loader parameters are restored after success or failure. Peak memory and speed still depend on the backend, model, resolution, and hardware.
 
 ## Quantization and model combinations
 
@@ -68,7 +68,7 @@ Refinement can change text, faces, and details. Metadata records the target, str
 1. Select your base checkpoint/preset normally.
 2. Enable Forge's existing **Refiner** accordion. If hidden, enable Refiner visibility in Forge settings.
 3. Select the target checkpoint; select the base checkpoint again for same-model refinement.
-4. Start with **Switch at 0.75**. Adjust CFG only if needed.
+4. Choose **Refiner only** or **Last steps + refiner**. At **Switch at 0.75**, a compatible 20-step Euler run uses 15 base steps, 5 target steps, then a final image pass. A value of 1 skips both target stages.
 5. Press **Generate**. Check generation parameters and the terminal for errors.
 
 ## Beginner installation

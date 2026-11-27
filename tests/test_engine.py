@@ -76,6 +76,19 @@ class Tests(unittest.TestCase):
         self.assertIsNone(self.p.refiner_checkpoint)
         self.assertEqual(self.p._pi_refiner, ('target',.8,7))
 
+    def test_api_runner_registers_refiner_controls_before_allocating_argument_slots(self):
+        native = type('ScriptRefiner', (), {'ui': Mock(), 'setup': Mock()})
+        self.modules.scripts.scripts_data = [types.SimpleNamespace(script_class=native)]
+        old_ui = native.ui
+        def allocate(runner, is_img2img):
+            self.assertIs(native.ui._pi_refiner_owner, self.engine._lifecycle_token)
+            native.setup(None,self.p,True,'target',.8,1,'',False,'','',0,False,self.engine._LAST_STEPS)
+            self.assertEqual(self.p._pi_refiner_mode, self.engine._LAST_STEPS)
+            return is_img2img
+        self.assertTrue(self.engine._before_runner_init(allocate)(object(), True))
+        self.engine._unload()
+        self.assertIs(native.ui, old_ui)
+
     def test_unload_restores_native(self):
         self.engine._unload()
         self.assertIs(self.native.setup,self.original_setup)
